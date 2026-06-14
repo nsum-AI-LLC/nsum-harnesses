@@ -1,0 +1,72 @@
+#!/bin/bash
+# List, view, or clear self-improvement proposals written by the Self-Improving Hook.
+# Usage:
+#   claude_proposals              # list all pending proposals (current project)
+#   claude_proposals view <name>  # view a proposal (or partial match)
+#   claude_proposals clear        # delete all pending proposals
+#   claude_proposals clear <name> # delete a specific proposal (or partial match)
+#
+# Proposals dir is ~/.claude/{project_name}-proposals where project_name is the
+# basename of $CLAUDE_PROJECT_DIR (or current directory if unset). Each project
+# gets its own bucket so proposals don't pollute across projects.
+
+set -u
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+PROJECT_NAME=$(basename "${PROJECT_DIR%/}")
+PROPOSALS_DIR="$HOME/.claude/${PROJECT_NAME}-proposals"
+
+if [ ! -d "$PROPOSALS_DIR" ]; then
+  echo "No proposals directory yet ($PROPOSALS_DIR)"
+  exit 0
+fi
+
+COUNT=$(find "$PROPOSALS_DIR" -maxdepth 1 -name '*.md' -type f | wc -l | tr -d ' ')
+
+if [ "$COUNT" = "0" ]; then
+  echo "No pending proposals."
+  exit 0
+fi
+
+cmd="${1:-list}"
+
+case "$cmd" in
+  list|"")
+    echo "$COUNT pending proposal(s) in $PROPOSALS_DIR:"
+    echo ""
+    ls -lt "$PROPOSALS_DIR"/*.md 2>/dev/null | awk '{ printf "  %s %s %s  %s\n", $6, $7, $8, $9 }'
+    echo ""
+    echo "View:  claude_proposals view <name>"
+    echo "Clear: claude_proposals clear [name]"
+    ;;
+  view)
+    if [ -z "${2:-}" ]; then
+      echo "Usage: claude_proposals view <name>" >&2
+      exit 1
+    fi
+    MATCH=$(find "$PROPOSALS_DIR" -maxdepth 1 -name "*$2*" -type f | head -1)
+    if [ -z "$MATCH" ]; then
+      echo "No proposal matches: $2" >&2
+      exit 1
+    fi
+    cat "$MATCH"
+    ;;
+  clear)
+    if [ -z "${2:-}" ]; then
+      echo "Removing all $COUNT pending proposal(s)..."
+      find "$PROPOSALS_DIR" -maxdepth 1 -name '*.md' -type f -delete
+      echo "Cleared."
+    else
+      MATCH=$(find "$PROPOSALS_DIR" -maxdepth 1 -name "*$2*" -type f)
+      if [ -z "$MATCH" ]; then
+        echo "No proposal matches: $2" >&2
+        exit 1
+      fi
+      echo "$MATCH" | xargs rm -v
+    fi
+    ;;
+  *)
+    echo "Usage: claude_proposals [list|view <name>|clear [name]]" >&2
+    exit 1
+    ;;
+esac

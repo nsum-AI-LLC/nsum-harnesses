@@ -1,0 +1,19 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets / local config — never commit
+.env
+.env.*
+
+# Logs / local state
+*.log
+
+# Git worktrees, if the harness is exercised in-repo
+.claude/worktrees/

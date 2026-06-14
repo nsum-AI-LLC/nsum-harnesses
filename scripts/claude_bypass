@@ -1,0 +1,67 @@
+#!/bin/bash
+# Log a precondition bypass with a structured reason category.
+# The bypassed path is marked satisfied so the gate stops blocking.
+#
+# Usage:
+#   claude_bypass <path> <category> [reason text]
+#
+# Categories:
+#   false_positive       — the detector that set this precondition mis-fired
+#   scope_limited        — this read is outside the scope of the current task
+#   already_familiar     — model has read this file recently (prior session)
+#   urgent_user_request  — user explicitly asked to proceed without reading
+#   other                — anything else; use sparingly
+#
+# The session id is required from $CLAUDE_SESSION_ID (set by the Claude harness).
+# If running outside a session, pass --session-id <id>.
+
+set -u
+
+usage() {
+  echo "Usage: claude_bypass <path> <category> [reason text]" >&2
+  echo "" >&2
+  echo "Categories: false_positive, scope_limited, already_familiar, urgent_user_request, other" >&2
+  exit 1
+}
+
+SESSION_ID="${CLAUDE_SESSION_ID:-}"
+
+# Support explicit --session-id for testing outside Claude
+if [ "${1:-}" = "--session-id" ]; then
+  SESSION_ID="${2:-}"
+  shift 2
+fi
+
+if [ -z "$SESSION_ID" ]; then
+  echo "Error: CLAUDE_SESSION_ID not set and --session-id not provided" >&2
+  exit 1
+fi
+
+if [ "$#" -lt 2 ]; then
+  usage
+fi
+
+PATH_ARG="$1"
+CATEGORY="$2"
+shift 2
+REASON="${*:-}"
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+SCRIPT="$PROJECT_DIR/.claude/scripts/precondition_state.py"
+
+if [ ! -x "$SCRIPT" ]; then
+  # Fall back to a copy sitting next to this CLI (repo or .claude/scripts layout)
+  SCRIPT="$(cd "$(dirname "$0")" && pwd)/precondition_state.py"
+fi
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "Error: precondition_state.py not found" >&2
+  exit 1
+fi
+
+"$SCRIPT" bypass \
+  --session-id "$SESSION_ID" \
+  --path "$PATH_ARG" \
+  --category "$CATEGORY" \
+  --reason "$REASON" \
+  --project-dir "$PROJECT_DIR"

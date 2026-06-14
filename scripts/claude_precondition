@@ -1,0 +1,73 @@
+#!/bin/bash
+# Set a required-read precondition for the current Claude session.
+# The next Skill/Agent/Edit/Write tool call will be blocked until the file
+# is Read or the precondition is explicitly bypassed via claude_bypass.
+#
+# Usage:
+#   claude_precondition <path> <reason>
+#   claude_precondition list                  # show current preconditions
+#   claude_precondition clear                 # clear all preconditions
+#
+# Session id is taken from $CLAUDE_SESSION_ID (set by the harness).
+# Outside a session, pass --session-id <id>.
+
+set -u
+
+usage() {
+  echo "Usage:" >&2
+  echo "  claude_precondition <path> <reason>   add a required read" >&2
+  echo "  claude_precondition list              show current preconditions" >&2
+  echo "  claude_precondition clear             clear all" >&2
+  exit 1
+}
+
+SESSION_ID="${CLAUDE_SESSION_ID:-}"
+if [ "${1:-}" = "--session-id" ]; then
+  SESSION_ID="${2:-}"
+  shift 2
+fi
+
+if [ -z "$SESSION_ID" ]; then
+  echo "Error: CLAUDE_SESSION_ID not set and --session-id not provided" >&2
+  exit 1
+fi
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+SCRIPT="$PROJECT_DIR/.claude/scripts/precondition_state.py"
+if [ ! -x "$SCRIPT" ]; then
+  # Fall back to a copy sitting next to this CLI (repo or .claude/scripts layout)
+  SCRIPT="$(cd "$(dirname "$0")" && pwd)/precondition_state.py"
+fi
+if [ ! -x "$SCRIPT" ]; then
+  echo "Error: precondition_state.py not found" >&2
+  exit 1
+fi
+
+cmd="${1:-}"
+
+case "$cmd" in
+  ""|-h|--help)
+    usage
+    ;;
+  list)
+    "$SCRIPT" list --session-id "$SESSION_ID" --project-dir "$PROJECT_DIR"
+    ;;
+  clear)
+    "$SCRIPT" clear --session-id "$SESSION_ID"
+    ;;
+  *)
+    if [ "$#" -lt 2 ]; then
+      usage
+    fi
+    PATH_ARG="$1"
+    shift
+    REASON="$*"
+    "$SCRIPT" add \
+      --session-id "$SESSION_ID" \
+      --path "$PATH_ARG" \
+      --reason "$REASON" \
+      --set-by "user/claude_precondition" \
+      --project-dir "$PROJECT_DIR"
+    echo "Precondition added: $PATH_ARG"
+    ;;
+esac
