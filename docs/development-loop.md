@@ -112,6 +112,12 @@ Not part of the linear flow — a *reflex*. Invoke it any time a recommendation 
 written, especially if "ship now / iterate later," "defer," or "that's a lot of work" appears. It forces
 the decision to be re-derived on merit, with cost/timeline/sunk-cost factors explicitly stripped out.
 
+It also catches a stranger habit from long autonomous runs: the model would invent a limit — "I'm
+fatigued," "the turn is getting long," "we're low on context" — and use it to cut scope or defer real work,
+as though its own completion drive had turned into anxiety about finishing. Session length isn't a real
+constraint (the harness carries context across windows), so the skill flags those worries as the imaginary
+boundaries they are.
+
 ## The adversarial ticket-review panel
 
 `workflows/ticket-review-panel.js` is a [Workflow](https://docs.claude.com/en/docs/claude-code) script: it
