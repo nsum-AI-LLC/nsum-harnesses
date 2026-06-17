@@ -93,9 +93,11 @@ re-reviewed.
 
 Implements one ticket end to end in its own worktree. Its first action is a **Step-0 self-check** — it
 runs `git rev-parse --show-toplevel` and aborts with `MISBINDING` if the platform misplaced it in the
-primary tree. It separates decision logic from persistence, batches writes, tests decisions (not the
-framework), and persists with an **atomic `git commit && git push`** so a reaped session can't strand a
-commit. It also refuses to build on an unsigned current-behavior claim.
+primary tree. It separates decision logic from persistence, batches writes, and tests decisions (not the
+framework) with **targeted** runs only — the full suite is CI's job. It persists at **checkpoints** with
+an **atomic `git commit && git push`** (and never busy-waits on a long command with a `sleep`-poll loop,
+which would starve its own stream and trip the watchdog), so a reap costs only the uncommitted tail rather
+than the whole task. It also refuses to build on an unsigned current-behavior claim.
 
 ### The code-reviewer (`agents/code-reviewer`) + the review skill
 

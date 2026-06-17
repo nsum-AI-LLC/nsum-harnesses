@@ -132,6 +132,8 @@ dispatch, run the **adversarial ticket-review panel** (see `workflows/ticket-rev
 independent reviewers attack the groomed ticket on different lenses. Resolve any blocking finding before
 dispatching the developer.
 
+**Testing in dispatch:** do not instruct the developer to run the full test suite locally — CI is the quality gate and runs it on every PR. The developer runs only *targeted* tests for the code it changed (per `developer.md`). A full local suite duplicates CI and leaves a long no-output window that risks a stream-watchdog reap; the only local run worth requesting is one CI does not perform (e.g. live/integration tests for LLM-adjacent changes).
+
 ### Phase 2 — Open PR
 After the developer reports done: verify the branch was pushed, open a PR against the main branch, report
 the URL to the user. **Stop — do not merge.**
@@ -193,6 +195,7 @@ built, key decisions, review findings addressed, PRs opened, current state.
 - **Merge conflict:** rebase onto the main branch and resolve properly. After a parent was squash-merged,
   a plain rebase of a stacked child fails (git tries to replay the parent's now-squashed commits) — use
   `git rebase --onto <main> <last-parent-commit> <branch>`, then `git push --force-with-lease`.
+- **A background agent with no completion/failure notification is RUNNING, not dead — never diagnose a reap from worktree state.** The stream watchdog is a *no-progress* timer, not a wall-clock cap: an agent that keeps streaming can run far past the window and still finish. An empty task list, zero commits on the branch, or half-written files in the worktree are all equally consistent with an agent that is *still working* and simply hasn't committed yet. A genuine reap arrives as an explicit `failed: stalled … (stream watchdog)` notification. Until you have that notification (or a non-blocking `TaskOutput` confirming the agent exited), treat the agent as live — do **not** re-dispatch it, decompose its ticket, or harvest-and-replace its worktree, or you risk spawning duplicate work (and duplicate PRs) against a healthy run.
 - **Repeated stream-death (silent reap after a successful tool result):** this is a runtime condition the
   harness can't prevent, only bound. On a success-rate cliff (≥2 consecutive reaps after a clean batch),
   **back off and surface "runtime degraded" to the user** — do NOT switch to serial dispatch (it treats
