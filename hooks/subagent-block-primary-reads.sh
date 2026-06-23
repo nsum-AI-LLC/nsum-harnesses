@@ -28,8 +28,10 @@
 #   3. Inside our own worktree → allow (the normal case).
 #   4. Inside ANOTHER worktree → defer to cross-worktree-read-guard.sh; ignore.
 #   5. Outside the primary repo entirely (/tmp, ~/.claude, ...) → allow.
-#   6. A primary-repo planning/** path → allow. Planning is the shared cross-tree
-#      surface and lives canonically in primary (mirrors the write guards).
+#   6. A primary-repo planning/** path → allow. Planning lives canonically in
+#      primary and a subagent READS it there. (Planning WRITES are the
+#      orchestrator's, not a subagent's — a subagent cannot write planning
+#      anywhere; see subagent-block-primary-writes.sh.)
 #   7. A primary-repo non-planning path WHERE a worktree twin exists → BLOCK with
 #      a redirect to the worktree copy. No twin (a main-only file) → fail open, so
 #      a main-only file is never a dead end.

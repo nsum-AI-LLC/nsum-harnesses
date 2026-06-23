@@ -10,9 +10,15 @@
 # This hook blocks writes ONLY when the TARGET path resolves inside the
 # current worktree (i.e., the worktree's own planning/ directory). Writes
 # to absolute paths in the primary repo — e.g., from a worktree's CWD to
-# /Users/.../proj/planning/foo — are ALLOWED. The orchestrator and
-# subagents can write planning artifacts to the primary repo using its
-# absolute path even when their CWD is in a worktree.
+# /Users/.../proj/planning/foo — are ALLOWED BY THIS HOOK. Note, however,
+# that the platform's built-in shared-checkout write-guard SEPARATELY
+# blocks ALL primary-tree writes from a SUBAGENT worktree (planning
+# included, no carve-out). So in practice only the orchestrator — or a
+# human working from a worktree CWD — can persist planning to primary. A
+# subagent cannot write planning ANYWHERE: this hook blocks the worktree
+# copy and the platform blocks the primary copy. A subagent therefore
+# hands finished planning content to the orchestrator (via its report),
+# which persists it. See the block message below and agents/developer.md.
 #
 # Why we don't trust CLAUDE_PROJECT_DIR alone: in practice, Claude Code has
 # been observed to set CLAUDE_PROJECT_DIR to the primary tree even when the
@@ -71,7 +77,13 @@ esac
 PRIMARY_BASE="${PROJECT_DIR%%/.claude/worktrees/*}"
 PRIMARY_PATH="$PRIMARY_BASE/$REL_TO_WORKTREE"
 
-REASON="Planning artifacts must be written to the primary repo, not a worktree. Write to: $PRIMARY_PATH (See CLAUDE.md § 'Worktree vs Primary Tree'.) The current path ($FILE_PATH) is inside a worktree branch that the user does not routinely review and that is discarded after merge."
+REASON="Planning files are not written from a worktree — they live in the primary repo (reviewed on the default branch) and the ORCHESTRATOR persists them.
+
+If you are an isolated subagent (developer / reviewer / analyst): the primary path is ALSO blocked for you, by the platform's built-in shared-checkout write-guard — so do NOT retry it ($PRIMARY_PATH). Retrying just loops you between the two guards. Planning is not yours to write. Put the finished content (status update, doc edit) in your final report and the orchestrator will write it to primary. If this whole ticket is a planning/docs change, say so in your report so the orchestrator takes it directly instead of via a worktree.
+
+If you are a human or the orchestrator working from a worktree CWD: the primary path is fine for you — write to $PRIMARY_PATH instead.
+
+(See CLAUDE.md § 'Worktree vs Primary Tree'. The current path $FILE_PATH is inside a worktree branch that is not routinely reviewed and is discarded after merge.)"
 
 jq -n --arg r "$REASON" '{decision: "block", reason: $r}'
 exit 0

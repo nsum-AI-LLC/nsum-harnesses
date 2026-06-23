@@ -123,6 +123,13 @@ For each batch (group independent tickets for parallel dispatch; serialize depen
 Launch a `developer` subagent with a one-sentence assignment; it reads its own context. Independent
 tickets → parallel Task calls in one message, each in its own worktree. Dependent tickets → serialize.
 
+**Docs-only / planning-only tickets — do NOT dispatch to a worktree subagent; write them yourself.** If a
+ticket's whole deliverable is a planning/tracking doc, implement it directly in the primary tree: a
+worktree subagent structurally *cannot* persist a planning doc (the worktree copy is blocked by
+`protect-worktree-planning.sh`, the primary copy by the platform's shared-checkout guard), so dispatching
+one deadlocks — it can write the deliverable nowhere. The orchestrator runs in primary and writes planning
+freely; this is the one ticket class you implement rather than delegate.
+
 **Branch target:** branch from the main branch by default. Only instruct the developer to stack on an
 unmerged parent branch when the child literally cannot compile or test without the parent's code
 (it imports something not yet on main). Stacking adds merge complexity — prefer independence.
@@ -177,8 +184,12 @@ Report "PR #{N} for {ticket-id} is ready to merge." **Do not merge.** List any p
 regular (non-squash) merge so downstream rebases stay clean; the last PR in a chain can be squashed.
 
 ### Phase 7 — Status update
-After the batch completes, write a status update where your project keeps them: tickets covered, what was
-built, key decisions, review findings addressed, PRs opened, current state.
+The developer cannot write planning/tracking docs from its worktree, so **you persist the per-ticket status
+update from the developer's report** — write it where your project keeps status updates, named for the
+ticket (what it built, key decisions, test results, issues/follow-ups, taken from its final report). You are
+in the primary tree, so this write is unblocked. After the whole batch completes, also write a batch status
+update: tickets covered, what was built, key decisions, review findings addressed, PRs opened, current
+state.
 
 ## Error handling
 

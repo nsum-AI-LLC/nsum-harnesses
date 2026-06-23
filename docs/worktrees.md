@@ -53,7 +53,7 @@ Project-level (`settings.json`):
 - `cross-worktree-read-guard.sh` — PreToolUse on Read: block reading into a worktree the session doesn't own.
 - `guard-branch-switch.sh` — PreToolUse on Bash: block `checkout`/`switch`/`gh pr checkout` from the primary cwd.
 - `guard-destructive-git.sh` — PreToolUse on Bash: block `git worktree remove`/`prune` (route through the script).
-- `protect-worktree-planning.sh` — PreToolUse on Write/Edit: keep `planning/**` writes on the primary tree.
+- `protect-worktree-planning.sh` — PreToolUse on Write/Edit: block a worktree's `planning/**` writes. A subagent cannot write planning *anywhere* — this blocks the worktree copy, and the platform's shared-checkout guard blocks the primary copy — so planning is the orchestrator's to persist (a subagent hands it over in its report; see the note below the guard lists).
 - `subagent-block-primary-writes.sh` — PreToolUse on Write/Edit: block writes that resolve into the primary tree. (Wired project-level for reliability; it no-ops for the orchestrator via its own scope check.)
 
 Subagent-scoped (agent frontmatter):
@@ -61,6 +61,16 @@ Subagent-scoped (agent frontmatter):
 - `subagent-block-primary-reads.sh` — PreToolUse on Read: block a subagent's read of the primary tree when a worktree twin exists, and return the corrected worktree path. Frontmatter-only by design — wired project-level it would block the orchestrator's constant primary reads. It also carries its own scope guard, so it's safe if mis-wired.
 
 Every guard is **fail-open**: on any error it allows the call. They are strong defaults, not a security boundary.
+
+**Planning docs are read-from-primary, written-by-orchestrator.** A subagent reads `planning/**` from the
+primary tree (the read guards carve it out) but writes it *nowhere*: `protect-worktree-planning.sh` blocks
+the worktree copy and the platform's shared-checkout guard blocks the primary copy. This is deliberate, not
+a gap. Planning artifacts are cross-cutting and belong to the orchestrator, which runs in primary and
+persists them — a subagent's status update reaches primary via its report, not its own write. Two corollaries
+keep this from becoming a trap: a subagent that needs a planning write must hand the content to the
+orchestrator (not retry either path — that just loops between the two guards), and the orchestrator must
+never dispatch a docs-only / planning-only ticket to a worktree subagent (it would deadlock, with the
+deliverable persistable nowhere) — the orchestrator writes those itself.
 
 ## The agent self-check
 

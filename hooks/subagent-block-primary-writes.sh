@@ -25,12 +25,18 @@
 #
 # 3. If the target is INSIDE the subagent's worktree, allow.
 #
-# 4. If the target is in primary repo and is a planning file, allow.
-#    Planning writes from worktree to primary are the one legitimate
-#    cross-tree write — see `protect-worktree-planning.sh` for the
-#    complementary rule that routes worktree-internal planning writes
-#    BACK to primary. Together the two hooks form the planning-doc
-#    routing contract.
+# 4. If the target is in primary repo and is a planning file, this hook
+#    would allow it — BUT the platform's built-in shared-checkout
+#    write-guard blocks ALL primary writes from a subagent worktree FIRST
+#    (planning included, no carve-out), so a subagent never actually
+#    reaches this branch. The carve-out is retained only as fail-open
+#    defense-in-depth for contexts the platform guard does not cover.
+#    The operative rule: a subagent does NOT write planning files
+#    ANYWHERE — `protect-worktree-planning.sh` blocks the worktree copy
+#    and the platform blocks the primary copy. Planning is the
+#    orchestrator's to persist; a subagent hands finished planning
+#    content to the orchestrator via its report. See
+#    `protect-worktree-planning.sh` and agents/developer.md.
 #
 # 5. Otherwise (target is primary repo non-planning, or target is
 #    outside both trees) BLOCK with a clear redirect to the equivalent
