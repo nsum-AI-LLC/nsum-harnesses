@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""claude_usage_meter — BW-4994 layer 1: rolling-window burn + projection.
+
+Reads NOTHING privileged: sums per-message `usage` blocks from the local session
+store (~/.claude/projects/**/*.jsonl — sessions AND subagents), over the trailing
+window of the unified 5h pool (single pool across models; the per-model UI bars
+are cosmetic — BW-4994 intel 2026-08-31).
+
+SWAPPABLE SOURCE SEAM (ticket requirement): the ceiling comes from, in order,
+  1. <root>/firstparty.json   {"window_ceiling_tokens": N}
+       — drop-in for a first-party utilization surface if one appears;
+  2. <root>/calibration.json  {"observations":[{"epoch":..,
+       "window_burn_tokens":..}]} — each observed 429 death records the burn the
+       window reached; the ceiling estimate is the MIN observed kill burn
+       (conservative: never assume more headroom than the worst measured kill);
+  3. none — burn is reported without a projection (confidence "none").
+
+Output: one JSON object on stdout + a human line on stderr. Exit 0 always —
+a meter must never break a caller.
+
+    claude_usage_meter               # trailing 5h, all projects
+    claude_usage_meter --hours 7     # e.g. the 7d pool would use --hours 168
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+
+
+# Directory names of earlier installs, checked before the default so an
+# in-place upgrade keeps a running job's specs, log and history where they
+# are. "willcall-relaunch" is the name this originally shipped under.
+LEGACY_ROOT_NAMES = ("willcall-relaunch",)
+
+
+def _relaunch_root():
+    """Mirrors relaunch_common.relaunch_root(); kept local so the meter runs
+    standalone (a statusline/hook may call it with the supervisor absent).
+    Order: explicit override, then an existing legacy install, then the default.
+    """
+    override = os.environ.get("CLAUDE_RELAUNCH_ROOT")
+    if override:
+        return override
+    for legacy in LEGACY_ROOT_NAMES:
+        candidate = os.path.join(HOME, ".claude", legacy)
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(HOME, ".claude", "claude-relaunch")
+
+
+ROOT = _relaunch_root()
+FIRSTPARTY = os.path.join(ROOT, "firstparty.json")
+CALIBRATION = os.path.join(ROOT, "calibration.json")
+STORE_GLOBS = (
+    os.path.join(HOME, ".claude", "projects", "*", "*.jsonl"),
+    os.path.join(HOME, ".claude", "projects", "*", "*", "subagents", "*.jsonl"),
+)
+
+# What counts as burn. Cache READS are metered far below fresh input by the
+# provider; weight them nominally rather than ignoring them so a cache-heavy
+# session still registers. Calibration absorbs the residual error — the
+# observations and the projection use the SAME formula, so a mis-weight cancels.
+CACHE_READ_WEIGHT = 0.1
+
+
+def usage_tokens(usage: dict) -> float:
+    return (usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("output_tokens", 0)
+            + CACHE_READ_WEIGHT * usage.get("cache_read_input_tokens", 0))
+
+
+def window_burn(hours: float) -> tuple:
+    cutoff_epoch = time.time() - hours * 3600
+    cutoff_iso = datetime.datetime.fromtimestamp(
+        cutoff_epoch, datetime.timezone.utc).isoformat()
+    total = 0.0
+    files = 0
+    for pattern in STORE_GLOBS:
+        for path in glob.glob(pattern):
+            try:
+                if os.path.getmtime(path) < cutoff_epoch:
+                    continue  # untouched since the window opened — no burn inside it
+                files += 1
+                with open(path) as f:
+                    for line in f:
+                        # Cheap pre-filter before JSON parse.
+                        if '"usage"' not in line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("timestamp", "") < cutoff_iso:
+                            continue
+                        usage = (rec.get("message") or {}).get("usage")
+                        if usage:
+                            total += usage_tokens(usage)
+            except OSError:
+                continue
+    return total, files
+
+
+def ceiling() -> tuple:
+    """(ceiling_tokens or None, source string)."""
+    try:
+        with open(FIRSTPARTY) as f:
+            value = json.load(f).get("window_ceiling_tokens")
+            if value:
+                return float(value), "firstparty"
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    try:
+        with open(CALIBRATION) as f:
+            obs = json.load(f).get("observations", [])
+            burns = [o["window_burn_tokens"] for o in obs
+                     if o.get("window_burn_tokens")]
+            if burns:
+                return float(min(burns)), f"calibration({len(burns)} obs)"
+    except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError):
+        pass
+    return None, "none"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--hours", type=float, default=5.0,
+                        help="trailing window (default 5 — the unified 5h pool)")
+    parser.add_argument("--record-kill", action="store_true",
+                        help="record the CURRENT window burn as a 429-kill "
+                             "calibration observation (run when a limit hits)")
+    args = parser.parse_args()
+
+    burn, files = window_burn(args.hours)
+    cap, source = ceiling()
+
+    if args.record_kill:
+        os.makedirs(ROOT, exist_ok=True)
+        try:
+            with open(CALIBRATION) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {"observations": []}
+        data["observations"].append(
+            {"epoch": time.time(), "window_burn_tokens": burn,
+             "hours": args.hours})
+        with open(CALIBRATION, "w") as f:
+            json.dump(data, f, indent=1)
+
+    result = {
+        "window_hours": args.hours,
+        "window_burn_tokens": round(burn),
+        "files_scanned": files,
+        "ceiling_tokens": round(cap) if cap else None,
+        "ceiling_source": source,
+        "utilization_pct": round(100 * burn / cap, 1) if cap else None,
+    }
+    print(json.dumps(result))
+    pct = f"{result['utilization_pct']}%" if cap else "n/a (no ceiling)"
+    print(f"[meter] {result['window_burn_tokens']:,} tokens / trailing "
+          f"{args.hours:g}h across {files} transcripts — utilization {pct} "
+          f"({source})", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""claude_relaunch_supervisor — the BW-4994 session-continuity supervisor (external half).
+
+Runs as a launchd tick (see the bundled .plist; StartInterval).
+Each tick it decides whether a Claude Code session needs an INTERACTIVE relaunch,
+and performs it by opening a real Terminal window.
+
+TWO RELAUNCH MODES, and the axis is WOUND-DOWN vs KILLED (not context vs usage):
+
+  * PICKUP (`claude "/pickup <id>"`) — for a session that WOUND DOWN. It wrote a
+    handoff, so a fresh session reads a current snapshot and loses nothing. This
+    is the context path and it works.
+  * RESUME (`claude_resume <id> "<salvage prompt>"`) — for a session KILLED
+    mid-flight by a usage limit. It wrote no handoff, so there is nothing for a
+    fresh session to pick up: `claude_handoff` greps the transcript and returns
+    the LAST handoff block in it, which for a killed session is the one its
+    PREDECESSOR handed it. The fresh session then silently re-runs a stale
+    mission while the dead session's real state — live agents, dirty worktrees,
+    unpushed branches — is orphaned. Measured 2026-09-04: session 22e943e2 was
+    relaunched into its predecessor's handoff, whose stated goal ("nine PRs open,
+    not one merged") was five merges out of date, and four interrupted agents'
+    work sat unharvested until a human noticed. Resuming keeps the context that
+    knows what was in flight, so the session can salvage its own work.
+
+MODEL: the supervisor names NO model. `~/.claude/settings.json` already encodes
+the policy (e.g. `model: fable`, `fallbackModel: [opus]`) and the client
+applies it per request; pinning `--model opus` here overrode that and kept a
+relaunched session off Fable even when Fable had capacity. Probing still names a
+model, because a canary must ask about a specific pool.
+
+Trigger feeds, in authority order (BW-4994 ancestor-staleness rule):
+
+  1. RELAUNCH SPECS — <root>/specs/*.json, written at wind-down
+     by the handoff flow (claude_write_relaunch_spec). THE SOLE AUTHORITATIVE
+     pickup-target source: a spec names the session id explicitly, so the
+     stale-ancestor problem (a summarization-continued session leaves its
+     ancestor's transcript greppable with an outdated handoff block) cannot arise.
+  2. LIMIT-DEATH WATCHDOG — a session killed by a usage limit BEFORE it could wind
+     down. Detected from the newest project transcripts: limit wording in the tail
+     of a transcript that has STOPPED GROWING. Wording, classification and reset
+     parsing all live in relaunch_common, grounded in the client's own renderer.
+     Synthesizes a spec for the NEWEST such session only; two+ distinct candidates
+     in the same tick is AMBIGUITY, which notifies the owner and relaunches nothing.
+
+How a death becomes a wait (rewritten 2026-09-03 after a three-day dormancy):
+
+  * A SHARED pool (session / weekly) gates every model, so it must be waited out.
+    The reset instant comes from the statusline's structured `rate_limits` capture
+    when one brackets the death, else from the death line's own prose.
+  * A MODEL-SCOPED pool (Opus / Sonnet / Fable / usage credits) does NOT gate the
+    other tiers, so there is nothing to wait for: relaunch NOW and let the
+    client's own `fallbackModel` chain land on a tier that is still open. This is
+    the case the Fable default made reachable.
+  * A death whose reset cannot be determined is NEVER dropped. It becomes
+    `wait_until: "probe"` and is polled until the pool answers. The predecessor
+    logged `watchdog_no_reset_time` and did nothing — 1,643 times across three
+    days, for one weekly kill it had detected correctly on the very first tick.
+  * Even a KNOWN reset is only an upper bound. Anthropic resets off-cycle, so a
+    waiting spec is probed periodically and launches the moment the pool reopens
+    rather than sleeping to a stale predicted time.
+
+Safety rails (all required by BW-4994):
+  * kill switch — the file <root>/pause stops everything;
+  * crash-loop cap — more than MAX_RELAUNCHES_PER_HOUR in the rolling hour stops
+    the supervisor and notifies, instead of thrashing;
+  * every action (and every refusal) is appended to log.jsonl with its trigger;
+  * a relaunch happens ONLY from a spec (feed 2 works by synthesizing one), and a
+    consumed spec moves to done/ so the same death cannot double-launch;
+  * an indeterminate probe (network down, no binary, timeout) is never read as
+    either answer — it just waits for the next tick.
+
+Standalone-testable: `claude_relaunch_supervisor --dry-run` prints decisions
+without launching anything, moving anything, or spending a probe; a bare run is
+one tick (the launchd entry point).
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import relaunch_common as rc  # noqa: E402
+
+HOME = os.path.expanduser("~")
+# Project-neutral: an existing legacy install keeps its own directory, so
+# upgrading in place never orphans a running launchd job or a pending spec.
+ROOT = rc.relaunch_root()
+SPEC_DIR = os.path.join(ROOT, "specs")
+DONE_DIR = os.path.join(ROOT, "done")
+LOG_PATH = os.path.join(ROOT, "log.jsonl")
+HISTORY_PATH = os.path.join(ROOT, "relaunch-history.jsonl")
+PAUSE_PATH = os.path.join(ROOT, "pause")
+PROBE_STATE_PATH = os.path.join(ROOT, "probe-state.json")
+
+PROJECTS_GLOB = os.path.join(HOME, ".claude", "projects", "*", "*.jsonl")
+
+MAX_RELAUNCHES_PER_HOUR = 3
+# A transcript that has not grown for this long is "not alive". Generous on
+# purpose: a thinking model can go minutes between JSONL appends; a usage-killed
+# session never appends again.
+DEAD_AFTER_SECONDS = 10 * 60
+# Only transcripts touched within this window are watchdog candidates at all —
+# older deaths were either handled or superseded by newer sessions.
+WATCHDOG_LOOKBACK_SECONDS = 36 * 3600
+# How many bytes of transcript tail to scan for the limit signature.
+TAIL_BYTES = 256 * 1024
+# Launch this long after the stated reset so the window has actually rolled.
+RESET_EPSILON_SECONDS = 3 * 60
+
+# Probe cadence while a spec waits. A probe is ~2s and ~1,440 weighted tokens —
+# 0.0006% of a 5h window, and literally zero while the pool is shut, since a
+# rejected request never reaches inference. Billed dollars are not the constraint
+# on a subscription (see relaunch_common's cost note), so polling can be routine.
+# Tighter near the predicted reset, where the answer is most likely to change.
+PROBE_INTERVAL_FAR_SECONDS = 20 * 60
+PROBE_INTERVAL_NEAR_SECONDS = 5 * 60
+PROBE_NEAR_WINDOW_SECONDS = 60 * 60
+
+# The first message a RESUMED session receives. Kept free of double quotes,
+# backticks and '$' because it is interpolated into an AppleScript string that is
+# itself interpolated into a shell line.
+SALVAGE_PROMPT = (
+    "The usage limit has reset. Before anything else, salvage the work that was "
+    "interrupted when the limit hit: check every agent that was in flight -- their "
+    "worktrees may hold uncommitted changes and their branches unpushed commits -- "
+    "harvest whatever completed, then carry on with the plan."
+)
+
+
+def log(event, **fields):
+    row = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+           "event": event, **fields}
+    os.makedirs(ROOT, exist_ok=True)
+    with open(LOG_PATH, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def notify(title, body):
+    """A macOS notification — the supervisor's only 'surface to the owner'."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{body}" with title "{title}"'],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass  # a failed notification must never break the tick
+
+
+def recent_relaunch_count():
+    cutoff = time.time() - 3600
+    count = 0
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH) as f:
+            for line in f:
+                try:
+                    if json.loads(line).get("epoch", 0) >= cutoff:
+                        count += 1
+                except json.JSONDecodeError:
+                    continue
+    return count
+
+
+def record_relaunch(spec, mode=None):
+    with open(HISTORY_PATH, "a") as f:
+        f.write(json.dumps({"epoch": time.time(),
+                            "session_id": spec.get("session_id"),
+                            "reason": spec.get("reason"),
+                            "mode": mode}) + "\n")
+
+
+def load_probe_state():
+    try:
+        with open(PROBE_STATE_PATH) as f:
+            state = json.load(f)
+            return state if isinstance(state, dict) else {}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def record_probe(session_id):
+    state = load_probe_state()
+    state[session_id] = time.time()
+    # Keep the file from growing without bound as sessions come and go.
+    cutoff = time.time() - 14 * 86400
+    state = {k: v for k, v in state.items()
+             if isinstance(v, (int, float)) and v >= cutoff}
+    tmp = PROBE_STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, PROBE_STATE_PATH)
+
+
+def probe_is_due(session_id, due_epoch):
+    last = load_probe_state().get(session_id, 0)
+    if not isinstance(last, (int, float)):
+        last = 0
+    now = time.time()
+    interval = PROBE_INTERVAL_FAR_SECONDS
+    if due_epoch is not None and 0 < due_epoch - now <= PROBE_NEAR_WINDOW_SECONDS:
+        interval = PROBE_INTERVAL_NEAR_SECONDS
+    return now - last >= interval
+
+
+def spec_created_epoch(spec):
+    """The spec's created_at as epoch seconds, or None if absent/unparseable."""
+    raw = spec.get("created_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def already_handled(session_id, death_mtime=None):
+    """Does a spec (pending or done) already cover THIS death?
+
+    Death-aware on purpose. A RESUMED session keeps its session id, so a spec that
+    handled an earlier death must not veto a later one — otherwise the first
+    usage-kill would be the last one this supervisor ever acted on for that
+    session, and the resume path would disable itself after a single use.
+
+    A spec covers a death only if it was written AFTER the transcript's final
+    append. If the transcript has grown since (the session resumed, ran, and died
+    again), that growth is a NEW death and earns a new spec. Callers that have no
+    death instant to compare against get the old identity-only behaviour.
+    """
+    for d in (SPEC_DIR, DONE_DIR):
+        for path in glob.glob(os.path.join(d, "*.json")):
+            try:
+                with open(path) as f:
+                    spec = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if spec.get("session_id") != session_id:
+                continue
+            if death_mtime is None:
+                return True
+            created = spec_created_epoch(spec)
+            # An unparseable/absent created_at is treated as covering the death:
+            # refusing to relaunch is the safe direction for an ambiguous spec.
+            if created is None or created >= death_mtime:
+                return True
+    return False
+
+
+def project_dir_for(transcript_path):
+    """~/.claude/projects/-Users-foo-bar/x.jsonl -> /Users/foo/bar.
+
+    The slug is lossy (a dash inside a real path segment is indistinguishable
+    from a separator), which used to be handled by special-casing one known
+    project. It is now resolved generically, against directories that actually
+    exist — so this serves any project, and worktree namespaces too.
+    """
+    slug = os.path.basename(os.path.dirname(transcript_path))
+    return rc.resolve_project_slug(slug)
+
+
+def terminal_limit_record(tail):
+    """The line of the session's OWN killing limit rejection, or None.
+
+    A transcript can carry limit wording without having died of one — agent
+    task-notifications and quoted text embed the exact provider message
+    mid-conversation (measured: the 2026-08-30 orchestrator transcript carries
+    its killed AGENTS' notifications while the session itself survived). So mere
+    marker presence in the tail is NOT a death; the death is a JSONL record the
+    client itself marked as an API error (``isApiErrorMessage: true`` — the same
+    field the statusline context calculation filters on), carrying limit wording,
+    in the transcript's FINAL records. Strict on purpose: a missed relaunch
+    degrades to the owner noticing; a false relaunch opens terminals against
+    sessions that never died.
+    """
+    lines = [ln for ln in tail.splitlines() if ln.strip()]
+    for line in lines[-20:]:
+        if '"isApiErrorMessage":true' not in line.replace(" ", ""):
+            continue
+        if rc.is_limit_death(line):
+            return line
+    return None
+
+
+def watchdog_synthesize(dry_run):
+    """Feed 2: turn an un-wound-down limit death into a spec (newest session only)."""
+    now = time.time()
+    candidates = []
+    for path in glob.glob(PROJECTS_GLOB):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if now - mtime < DEAD_AFTER_SECONDS:          # still alive
+            continue
+        if now - mtime > WATCHDOG_LOOKBACK_SECONDS:   # ancient
+            continue
+        session_id = os.path.splitext(os.path.basename(path))[0]
+        # mtime is this death's instant: a spec written before it belongs to an
+        # EARLIER death of the same (resumed) session and must not veto this one.
+        if already_handled(session_id, death_mtime=mtime):
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, os.path.getsize(path) - TAIL_BYTES))
+                tail = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        death_line = terminal_limit_record(tail)
+        if death_line is None:
+            continue
+        candidates.append((mtime, session_id, path, death_line))
+
+    if not candidates:
+        return
+    candidates.sort(reverse=True)
+    if len({c[1] for c in candidates}) > 1:
+        # BW-4994 ambiguity rule: never guess between sessions.
+        names = ", ".join(c[1][:8] for c in candidates)
+        log("watchdog_ambiguous", candidates=[c[1] for c in candidates])
+        notify("Claude relaunch supervisor",
+               f"Multiple limit-dead sessions ({names}) — not relaunching. "
+               f"Write a spec for the right one.")
+        return
+
+    mtime, session_id, path, death_line = candidates[0]
+    kind, limit_name = rc.classify_limit(death_line)
+
+    # Structured epoch seconds from the statusline capture beat parsing prose;
+    # prose is the fallback, and neither being available is survivable now.
+    reset = rc.structured_reset(kind, mtime)
+    reset_source = "statusline"
+    if reset is None:
+        reset = rc.parse_reset(death_line, mtime)
+        reset_source = "transcript-prose" if reset else "none"
+
+    if rc.waits_for_reset(kind):
+        # A shared pool blocks every tier — the allotment is genuinely spent, so
+        # there is nothing to do but wait it out. Which TIER the relaunch then
+        # runs on is the client's decision, from settings' model/fallbackModel.
+        if reset is not None:
+            wait_until = (reset + datetime.timedelta(
+                seconds=RESET_EPSILON_SECONDS)).isoformat()
+        else:
+            # Unknown reset is NOT a reason to do nothing. Poll until it opens.
+            wait_until = "probe"
+    else:
+        # Model-scoped: another tier is open right now. Waiting would be the bug —
+        # the client's fallbackModel chain lands the relaunch on an open tier.
+        wait_until = "now"
+
+    spec = {
+        "session_id": session_id,
+        "reason": "usage-crash-watchdog",
+        # A watchdog death wrote no handoff, so there is nothing to /pickup:
+        # resume the session itself and have it salvage its own in-flight work.
+        "mode": "resume",
+        "wait_until": wait_until,
+        "limit_kind": kind,
+        "limit_name": limit_name,
+        "reset_source": reset_source,
+        "project_dir": project_dir_for(path),
+        "created_by": "watchdog",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    log("watchdog_spec_synthesized", **spec)
+    if dry_run:
+        print(f"[dry-run] would synthesize spec: {json.dumps(spec)}")
+        return
+    os.makedirs(SPEC_DIR, exist_ok=True)
+    with open(os.path.join(SPEC_DIR, f"spec-{session_id}.json"), "w") as f:
+        json.dump(spec, f, indent=1)
+
+
+def transcript_path_for(session_id):
+    """The largest live transcript for this session id, or None."""
+    matches = glob.glob(os.path.join(
+        HOME, ".claude", "projects", "*", f"{session_id}.jsonl"))
+    if not matches:
+        return None
+    try:
+        return max(matches, key=lambda p: os.path.getmtime(p))
+    except OSError:
+        return matches[0]
+
+
+def transcript_mtime(session_id):
+    path = transcript_path_for(session_id)
+    if path is None:
+        return None
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def relaunch_mode(spec):
+    """'resume' (continue the SAME session) or 'pickup' (start a fresh one).
+
+    See the module docstring: the axis is wound-down vs killed. A watchdog spec is
+    by construction a session that died before it could write a handoff, so there
+    is no handoff to pick up and resuming is the only lossless move. An explicit
+    `mode` in the spec always wins, so a spec can ask for either.
+    """
+    explicit = spec.get("mode")
+    if explicit in ("resume", "pickup"):
+        return explicit
+    return "resume" if spec.get("created_by") == "watchdog" else "pickup"
+
+
+def resume_blocked_reason(spec):
+    """Why this session must NOT be resumed right now, or None if it is safe.
+
+    `claude --resume` on a session that is already running starts a COPY (the
+    CLI says so itself), which forks the conversation. Between synthesis and
+    launch a human may well have resumed the session by hand — that is exactly
+    what happened on 2026-09-04 — so liveness is re-checked at the moment of
+    launch, not just when the death was detected.
+    """
+    session = spec["session_id"]
+    path = transcript_path_for(session)
+    if path is None:
+        return "no transcript found to resume"
+    mtime = transcript_mtime(session)
+    if mtime is not None and time.time() - mtime < DEAD_AFTER_SECONDS:
+        return "transcript is growing again (already resumed elsewhere)"
+    return None
+
+
+def retire(spec_path):
+    """Move a consumed spec to done/, preserving any earlier spec for the session.
+
+    Timestamped on collision because a resumed session keeps its id, so a second
+    death produces a second spec with the same filename; overwriting would erase
+    the record of the first.
+    """
+    base = os.path.basename(spec_path)
+    target = os.path.join(DONE_DIR, base)
+    if os.path.exists(target):
+        root, ext = os.path.splitext(base)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        target = os.path.join(DONE_DIR, f"{root}-{stamp}{ext}")
+    os.replace(spec_path, target)
+
+
+def resume_helper_for(project):
+    """The claude_resume helper to drive a resume with, or None for none found.
+
+    It reconciles the archive against the live transcript and resolves the project
+    namespace — work a relaunch should not reimplement.
+
+    Order: the claude-tooling GOLD copy first, then the project's own. A project
+    copy is a synced artifact (`sync_tooling` overwrites
+    `<project>/.claude/scripts/*` from claude-tooling), so it can lag the gold
+    one. A lagging copy degrades safely rather than breaking — its old arg loop
+    reads the id and ignores the trailing prompt, resuming without the salvage
+    instruction — but preferring the gold copy means that rarely has to happen.
+    `CLAUDE_TOOLING_DIR` overrides where the gold copy lives.
+    """
+    tooling = os.environ.get(
+        "CLAUDE_TOOLING_DIR", os.path.join(HOME, "projects", "claude-tooling"))
+    candidates = [
+        os.path.join(tooling, "scripts", "claude_resume"),
+        os.path.join(project, ".claude", "scripts", "claude_resume"),
+    ]
+    for path in candidates:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def build_command(spec, project):
+    """The shell command a relaunch runs, and the mode it represents.
+
+    No --model: ~/.claude/settings.json already carries the tier policy
+    (e.g. fable, falling back to opus) and the client applies it per request.
+    Naming a model here overrode that policy and pinned a relaunch to one tier.
+    """
+    session = spec["session_id"]
+    explicit = spec.get("cmd")
+    if explicit:
+        return explicit, spec.get("mode") or "custom"
+    mode = relaunch_mode(spec)
+    if mode == "resume":
+        helper = resume_helper_for(project)
+        if helper:
+            return f'{helper} {session} \\"{SALVAGE_PROMPT}\\"', "resume"
+        # No helper on this machine: resume directly. Loses the archive/live
+        # reconciliation, keeps the thing that matters — the same session.
+        return (f'claude --resume {session} \\"{SALVAGE_PROMPT}\\"', "resume")
+    return f'claude \\"/pickup {session}\\"', "pickup"
+
+
+def launch(spec, dry_run):
+    # Every spec carries project_dir (the writer records CLAUDE_PROJECT_DIR; the
+    # watchdog resolves it from the transcript's slug), so the fallback is only
+    # for a hand-written spec that omitted it.
+    project = spec.get("project_dir") or os.getcwd()
+    session = spec["session_id"]
+    cmd, mode = build_command(spec, project)
+    shell_line = f"cd {project} && {cmd}"
+    # Prefer iTerm2 when installed (the owner's terminal — its AppleScript API
+    # opens a real window + writes the command); Terminal.app is the fallback so
+    # a machine without iTerm still relaunches.
+    if os.path.isdir("/Applications/iTerm.app"):
+        osa = (
+            'tell application "iTerm"\n'
+            '  activate\n'
+            '  create window with default profile\n'
+            '  tell current session of current window\n'
+            f'    write text "{shell_line}"\n'
+            '  end tell\n'
+            'end tell'
+        )
+    else:
+        osa = (f'tell application "Terminal" to do script "{shell_line}"\n'
+               f'tell application "Terminal" to activate')
+    if dry_run:
+        print(f"[dry-run] would launch: {shell_line}")
+        return
+    subprocess.run(["osascript", "-e", osa], check=True, timeout=30)
+    record_relaunch(spec, mode)
+    log("relaunched", session_id=session, reason=spec.get("reason"),
+        mode=mode, shell=shell_line)
+    verb = "Resumed" if mode == "resume" else "Relaunched"
+    notify("Claude relaunch supervisor",
+           f"{verb} session {session[:8]} ({spec.get('reason')}).")
+
+
+def should_launch_now(spec, dry_run):
+    """(launch?, note) for one waiting spec.
+
+    Three shapes of wait:
+      "now"    -> launch on this tick;
+      "probe"  -> reset unknown; launch when a probe says the pool answers;
+      <ISO ts> -> launch at that instant, OR earlier if a probe says the pool
+                  reopened ahead of the predicted time (off-cycle resets are real
+                  and cost two days the last time one went unnoticed).
+    """
+    session_id = spec["session_id"]
+    wait_until = spec.get("wait_until") or "now"
+    if wait_until == "now":
+        return True, "due"
+
+    due_epoch = None
+    if wait_until != "probe":
+        try:
+            due = datetime.datetime.fromisoformat(wait_until)
+        except ValueError:
+            log("spec_bad_wait_until", session_id=session_id, value=wait_until)
+            return False, "unparseable wait_until"
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=datetime.timezone.utc)
+        due_epoch = due.timestamp()
+        if due_epoch <= time.time():
+            return True, "reset time reached"
+
+    if not probe_is_due(session_id, due_epoch):
+        log("spec_waiting", session_id=session_id, due=wait_until)
+        return False, "waiting"
+
+    # A canary must name a pool, so probing still picks a model even though the
+    # relaunch itself does not. Legacy specs may carry a "model" hint; specs
+    # written now do not, and the kind alone answers it for every named limit.
+    model = rc.probe_model_for(spec.get("limit_kind"), spec.get("model"))
+    if dry_run:
+        print(f"[dry-run] would probe {model} for {session_id[:8]} "
+              f"(wait_until={wait_until})")
+        return False, "dry-run: probe skipped"
+
+    record_probe(session_id)
+    available, detail = rc.probe_available(model)
+    log("probe", session_id=session_id, model=model, available=available,
+        detail=detail, due=wait_until)
+    if available is not True:
+        # False = still closed; None = we do not know. Neither launches.
+        return False, f"probe says {available}"
+
+    log("probe_early_release", session_id=session_id, model=model,
+        due=wait_until)
+    notify("Claude relaunch supervisor",
+           f"Usage available ahead of schedule — resuming {session_id[:8]}.")
+    return True, "probe found the pool open"
+
+
+def tick(dry_run):
+    os.makedirs(SPEC_DIR, exist_ok=True)
+    os.makedirs(DONE_DIR, exist_ok=True)
+
+    if os.path.exists(PAUSE_PATH):
+        log("paused")
+        return 0
+
+    count = recent_relaunch_count()
+    if count >= MAX_RELAUNCHES_PER_HOUR:
+        log("crash_loop_cap", recent=count)
+        notify("Claude relaunch supervisor",
+               f"{count} relaunches in the last hour — capped. "
+               f"Investigate; touch 'pause' to silence.")
+        return 1
+
+    # Feed 2 first, so a fresh death becomes a spec this same tick.
+    watchdog_synthesize(dry_run)
+
+    for path in sorted(glob.glob(os.path.join(SPEC_DIR, "*.json"))):
+        try:
+            with open(path) as f:
+                spec = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            log("spec_unreadable", path=path, error=str(exc))
+            continue
+        if not spec.get("session_id"):
+            log("spec_invalid", path=path)
+            continue
+        try:
+            go, note = should_launch_now(spec, dry_run)
+        except Exception as exc:  # a broken decision must not stall the queue
+            log("decision_failed", session_id=spec.get("session_id"),
+                error=str(exc))
+            continue
+        if not go:
+            if dry_run:
+                print(f"[dry-run] holding {spec['session_id'][:8]}: {note}")
+            continue
+        # Re-check liveness at the LAST moment for a resume: --resume on a running
+        # session starts a copy, and the window between deciding and launching is
+        # exactly when a human resumes the session by hand.
+        if relaunch_mode(spec) == "resume":
+            blocked = resume_blocked_reason(spec)
+            if blocked:
+                log("resume_skipped", session_id=spec["session_id"],
+                    reason=blocked)
+                notify("Claude relaunch supervisor",
+                       f"Not resuming {spec['session_id'][:8]}: {blocked}.")
+                if dry_run:
+                    print(f"[dry-run] would skip + retire "
+                          f"{spec['session_id'][:8]}: {blocked}")
+                else:
+                    retire(path)
+                continue
+        try:
+            launch(spec, dry_run)
+        except Exception as exc:  # a failed launch must be visible, not fatal
+            log("launch_failed", session_id=spec.get("session_id"),
+                error=str(exc))
+            notify("Claude relaunch supervisor",
+                   f"Launch FAILED for {spec.get('session_id', '?')[:8]}: {exc}")
+            continue
+        if not dry_run:
+            retire(path)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print decisions; launch nothing, move nothing, "
+                             "spend no probe")
+    parser.add_argument("--probe", metavar="MODEL", default=None,
+                        help="run one availability probe and exit (diagnostic)")
+    args = parser.parse_args()
+    if args.probe:
+        available, detail = rc.probe_available(args.probe)
+        print(json.dumps({"model": args.probe, "available": available,
+                          "detail": detail}, indent=1))
+        return 0
+    return tick(dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

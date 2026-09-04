@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""claude_write_relaunch_spec — write the BW-4994 relaunch spec at wind-down.
+
+The one-line addition the handoff flow gains: at wind-down the session records
+WHICH session id to pick up, WHY, and WHEN — the sole authoritative target the
+supervisor acts on (the ancestor-staleness rule: never discovered by grepping
+transcripts).
+
+Usage:
+    claude_write_relaunch_spec <session-id> context
+    claude_write_relaunch_spec <session-id> usage "2026-09-04T03:00:00-07:00"
+    claude_write_relaunch_spec <session-id> usage "4am America/Los_Angeles"
+    claude_write_relaunch_spec <session-id> usage "Sep 4 at 3am (America/Los_Angeles)"
+    claude_write_relaunch_spec <session-id> usage probe
+    claude_write_relaunch_spec <session-id> usage \
+        "You've hit your weekly limit · resets Sep 4 at 3am (America/Los_Angeles)"
+
+reason=context -> wait_until "now" (relaunch on the next supervisor tick).
+reason=usage   -> wait_until required. Accepts an ISO-8601 datetime, either shape
+                  the client renders (bare clock or "<Mon> <D> at <time>"), a whole
+                  pasted limit line, or the literal "probe" when the reset is
+                  unknown and the supervisor should poll until the pool reopens.
+
+Reset parsing is shared with the supervisor (relaunch_common) rather than
+reimplemented here — the 2026-09-03 dormancy came from a hand-rolled second
+parser that had only ever seen one of the two shapes.
+"""
+
+import datetime
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import relaunch_common as rc  # noqa: E402
+
+ROOT = rc.relaunch_root()
+SPEC_DIR = os.path.join(ROOT, "specs")
+
+RESET_EPSILON_SECONDS = 3 * 60
+
+
+def resolve_wait_until(reason, raw):
+    if reason == "context":
+        return "now"
+    raw = (raw or "").strip()
+    if not raw:
+        raise SystemExit("usage reason requires a wait_until argument "
+                         "(a time, a pasted limit line, or 'probe')")
+    if raw.lower() == "probe":
+        return "probe"
+    try:
+        return datetime.datetime.fromisoformat(raw).isoformat()
+    except ValueError:
+        pass
+    # The shared parser keys off the word "resets", so a bare time or date is
+    # normalized into the shape it was written against.
+    text = raw if "resets" in raw.lower() else f"resets {raw}"
+    reset = rc.parse_reset(text, datetime.datetime.now().timestamp())
+    if reset is None:
+        raise SystemExit(f"unparseable wait_until: {raw!r} "
+                         f"(try ISO-8601, '3am America/Los_Angeles', "
+                         f"'Sep 4 at 3am (America/Los_Angeles)', or 'probe')")
+    return (reset + datetime.timedelta(
+        seconds=RESET_EPSILON_SECONDS)).isoformat()
+
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[2] not in ("context", "usage"):
+        print(__doc__)
+        return 2
+    session_id, reason = sys.argv[1], sys.argv[2]
+    raw = sys.argv[3] if len(sys.argv) > 3 else ""
+    wait_until = resolve_wait_until(reason, raw)
+
+    kind, limit_name = rc.classify_limit(raw) if reason == "usage" else (None, None)
+    if kind is not None and not rc.waits_for_reset(kind):
+        # A model-scoped wall (Opus / Sonnet / Fable / credits) does not gate the
+        # other tiers, so its reset instant is irrelevant even when the pasted
+        # line states one: relaunch NOW on a tier that is still open. Waiting out
+        # a Fable week while Opus sits available is the dormancy this supervisor
+        # exists to prevent, and the watchdog already refuses to do it.
+        wait_until = "now"
+    spec = {
+        "session_id": session_id,
+        "reason": reason,
+        # No model. ~/.claude/settings.json carries the tier policy (e.g.
+        # model fable, fallbackModel opus) and the client applies it per
+        # request, including the fall back to Opus when Fable's own pool is
+        # spent. A spec that named a tier overrode that policy and pinned the
+        # relaunch to one model for the life of the session.
+        "wait_until": wait_until,
+        **({"limit_kind": kind, "limit_name": limit_name} if kind else {}),
+        # The session's own project. CLAUDE_PROJECT_DIR is set for hook and
+        # session contexts; the cwd fallback covers a hand-run invocation.
+        "project_dir": os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
+        "created_by": "wind-down",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    os.makedirs(SPEC_DIR, exist_ok=True)
+    path = os.path.join(SPEC_DIR, f"spec-{session_id}.json")
+    with open(path, "w") as f:
+        json.dump(spec, f, indent=1)
+    print(f"relaunch spec written: {path} (wait_until={wait_until})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

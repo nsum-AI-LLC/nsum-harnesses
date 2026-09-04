@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Smart resume: archive is the source of truth for session logs.
+#
+# 1. Find session in archive (~/.claude/session-archive/)
+# 2. Compare file size: if archive is bigger than live copy, update live
+# 3. Ensure session file exists in the project namespace claude --resume expects
+# 4. cd to project directory and resume
+#
+# Usage: claude_resume [-yolo] [--model M] <session_id> [prompt]
+#
+# -yolo           Skip permission prompts (--dangerously-skip-permissions)
+# --model M       Resume on a specific model tier (passed through to claude)
+# [prompt]        Optional first message to send into the resumed session. This is
+#                 what the relaunch supervisor uses to hand a usage-killed session
+#                 its salvage instruction ("the usage limit has reset — ...").
+
+CLAUDE_PROJECTS="$HOME/.claude/projects"
+ARCHIVE_DIR="$HOME/.claude/session-archive"
+
+YOLO=""
+EXTRA_ARGS=()
+# Leading flags are consumed here so the positionals that follow are exactly
+# <session_id> [prompt]. (The old loop guarded on `$# -gt 1` to keep the session
+# id last; with an optional trailing prompt the id is no longer last, so the
+# guard is `$# -gt 0` and each case shifts what it consumes.)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -yolo)         YOLO="--dangerously-skip-permissions"; shift ;;
+        --worktree|-w) shift ;;  # no-op: worktree is auto-detected
+        --model)       EXTRA_ARGS+=(--model "$2"); shift 2 ;;
+        --)            shift; break ;;
+        *)             break ;;
+    esac
+done
+
+session_id="${1%.jsonl}"
+if [[ -z "$session_id" ]]; then
+    echo "Usage: claude_resume [-yolo] [--model M] <session_id> [prompt]"
+    exit 1
+fi
+[[ $# -gt 0 ]] && shift
+resume_prompt="${1-}"
+
+archive_file="$ARCHIVE_DIR/${session_id}.jsonl"
+
+# Step 1: Find the session — archive first, then live namespaces
+if [[ ! -f "$archive_file" ]]; then
+    # Not in archive — search live namespaces and archive it
+    live_file=$(find "$CLAUDE_PROJECTS" -name "${session_id}.jsonl" -type f 2>/dev/null | head -1)
+    if [[ -z "$live_file" ]]; then
+        echo "Session not found: $session_id"
+        echo "Checked: $ARCHIVE_DIR and $CLAUDE_PROJECTS"
+        exit 1
+    fi
+    mkdir -p "$ARCHIVE_DIR"
+    cp "$live_file" "$archive_file"
+    echo "Archived session from live namespace"
+fi
+
+# Step 2: Find the live copy and compare sizes
+live_file=$(find "$CLAUDE_PROJECTS" -name "${session_id}.jsonl" -type f 2>/dev/null | head -1)
+
+if [[ -n "$live_file" && -f "$live_file" ]]; then
+    archive_size=$(stat -f %z "$archive_file" 2>/dev/null || stat -c %s "$archive_file" 2>/dev/null)
+    live_size=$(stat -f %z "$live_file" 2>/dev/null || stat -c %s "$live_file" 2>/dev/null)
+
+    if [[ "$archive_size" -gt "$live_size" ]]; then
+        echo "Archive copy is larger than live copy:"
+        echo "  Archive: ${archive_size}B  $archive_file"
+        echo "  Live:    ${live_size}B  $live_file"
+
+        # Check for collision variants
+        COLLISIONS_DIR="$ARCHIVE_DIR/collisions"
+        collision_files=$(find "$COLLISIONS_DIR" -name "${session_id}-*.jsonl" 2>/dev/null)
+        if [[ -n "$collision_files" ]]; then
+            echo ""
+            echo "Collision variants found:"
+            while IFS= read -r cf; do
+                cf_size=$(stat -f %z "$cf" 2>/dev/null || stat -c %s "$cf" 2>/dev/null)
+                echo "  $(basename "$cf"): ${cf_size}B"
+            done <<< "$collision_files"
+        fi
+
+        echo ""
+        if [[ -t 0 ]]; then
+            read -p "Overwrite live copy with archive? [y/N] " confirm
+        else
+            # Non-interactive (the relaunch supervisor drives this). Never block on
+            # a prompt nobody can answer — that would hang the relaunch forever.
+            # Keeping the live copy is the safe default: it is the file the crashed
+            # session was actually appending to, so it holds the newest turns.
+            confirm="n"
+            echo "Non-interactive — keeping live copy"
+        fi
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            cp "$archive_file" "$live_file"
+            echo "Updated live copy from archive"
+        else
+            echo "Keeping live copy — resuming with existing file"
+        fi
+    fi
+fi
+
+# Step 3: Determine project directory from the live file's namespace
+# If no live file exists, find the main project namespace and copy archive there
+if [[ -z "$live_file" ]]; then
+    # Find a main project namespace (not a worktree namespace)
+    for candidate in "$CLAUDE_PROJECTS"/-Users-*; do
+        if [[ -d "$candidate" && ! "$candidate" =~ "--claude-worktrees-" ]]; then
+            cp "$archive_file" "$candidate/${session_id}.jsonl"
+            live_file="$candidate/${session_id}.jsonl"
+            echo "Restored session to: $candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$live_file" ]]; then
+    echo "Could not determine project namespace for resume"
+    exit 1
+fi
+
+# Decode the encoded project path back to a filesystem path.
+decode_path() {
+    local encoded="$1"
+    local rest="${encoded#-}"
+    local IFS='-'
+    read -ra parts <<< "$rest"
+
+    local path=""
+    local i=0
+    while [[ $i -lt ${#parts[@]} ]]; do
+        if [[ -z "${parts[$i]}" ]]; then
+            ((i++))
+            if [[ $i -lt ${#parts[@]} ]]; then
+                local dot_combined=".${parts[$i]}"
+                ((i++))
+                while [[ $i -lt ${#parts[@]} ]]; do
+                    if [[ -d "$path/$dot_combined" ]]; then
+                        break
+                    fi
+                    dot_combined="$dot_combined-${parts[$i]}"
+                    ((i++))
+                done
+                path="$path/$dot_combined"
+            fi
+            continue
+        fi
+
+        local candidate="$path/${parts[$i]}"
+        if [[ -d "$candidate" ]]; then
+            path="$candidate"
+            ((i++))
+        else
+            local combined="${parts[$i]}"
+            local found=0
+            ((i++))
+            while [[ $i -lt ${#parts[@]} ]]; do
+                if [[ -z "${parts[$i]}" ]]; then
+                    break
+                fi
+                combined="$combined-${parts[$i]}"
+                ((i++))
+                if [[ -d "$path/$combined" ]]; then
+                    path="$path/$combined"
+                    found=1
+                    break
+                fi
+                local combined_underscore="${combined//-/_}"
+                if [[ -d "$path/$combined_underscore" ]]; then
+                    path="$path/$combined_underscore"
+                    found=1
+                    break
+                fi
+            done
+            if [[ $found -eq 0 ]]; then
+                local combined_underscore="${combined//-/_}"
+                if [[ -d "$path/$combined_underscore" ]]; then
+                    path="$path/$combined_underscore"
+                else
+                    path="$path/$combined"
+                fi
+            fi
+        fi
+    done
+    echo "$path"
+}
+
+encoded=$(dirname "$live_file" | sed 's|.*/projects/||')
+project_dir=$(decode_path "$encoded")
+
+# If worktree was deleted, fall back to main project root
+if [[ ! -d "$project_dir" ]]; then
+    main_root="${project_dir%%/.claude/worktrees/*}"
+    if [[ "$main_root" != "$project_dir" && -d "$main_root" ]]; then
+        echo "Worktree deleted — using project root: $main_root"
+        project_dir="$main_root"
+
+        # Copy session into the main namespace so claude --resume finds it
+        main_encoded=$(echo "$project_dir" | sed 's|/|-|g')
+        main_ns="$CLAUDE_PROJECTS/$main_encoded"
+        mkdir -p "$main_ns"
+        if [[ ! -f "$main_ns/${session_id}.jsonl" ]]; then
+            cp "$archive_file" "$main_ns/${session_id}.jsonl"
+        fi
+    fi
+fi
+
+echo "Resuming from: $project_dir"
+cd "$project_dir" || exit 1
+
+# `claude --resume <id> [prompt]`: --resume takes the id, the prompt stays a
+# positional. Verified against the CLI's own parser — with the id supplied,
+# a trailing prompt is not mistaken for the session argument.
+if [[ -n "$resume_prompt" ]]; then
+    exec claude --resume "$session_id" $YOLO "${EXTRA_ARGS[@]}" "$resume_prompt"
+fi
+exec claude --resume "$session_id" $YOLO "${EXTRA_ARGS[@]}"

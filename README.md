@@ -51,8 +51,7 @@ project's own quality standards and development procedures, and to make them per
 | Context Cascade (`examples/CLAUDE.md`) | per-directory `CLAUDE.md` files that load along the path from the file you're editing up to the repo root |
 | Read-tracking log (`hooks/read-tracker.sh`) | records every file the agent reads in a session |
 | Precondition gates (`hooks/precondition-gate.sh`, `scripts/precondition_state.py`, `scripts/claude_precondition`, `scripts/claude_bypass`) | block Edit/Write/Skill/Agent until required reading is done; bypasses are logged with a reason taxonomy |
-| Session briefing (`hooks/session-start.sh`, `scripts/session_briefing.py`) | a short "what's going on" injected at session start |
-| **Suggestion Collector** (`hooks/self-improve.sh`, `scripts/reflect-on-transcript.py`, `scripts/claude_proposals`) | reflects on each session, writes improvement proposals, surfaces them at the next session start — the harness that improves the harness. See [`docs/suggestion-collector.md`](docs/suggestion-collector.md) |
+| **Suggestion Collector** (`hooks/self-improve.sh`, `scripts/reflect-on-transcript.py`, `scripts/claude_proposals`) | reflects on each session and writes improvement proposals you review on your own schedule (`claude_proposals`, or the `review-suggestions` skill) — the harness that improves the harness. See [`docs/suggestion-collector.md`](docs/suggestion-collector.md) |
 
 ### Tier 2 — Orchestration safety (for the orchestrator → worktree pattern)
 
@@ -81,6 +80,18 @@ The roles that hold each other accountable through a ticket's lifecycle. Walkthr
 
 The autonomy workflow — handing the loop a plan and stepping away — is in [`docs/autonomous-operation.md`](docs/autonomous-operation.md).
 
+### Tier 4 — Session continuity (macOS)
+
+Surviving the two walls that end a long run — a full context window, and a usage limit.
+The distinction that matters: **wound-down vs killed, not context vs usage.** Full write-up:
+[`docs/session-continuity.md`](docs/session-continuity.md).
+
+| Component | What it does |
+|---|---|
+| Relaunch supervisor (`relaunch/`) | a launchd tick that waits out the wall and relaunches the session — picking up a session that wound down, and *resuming* one that was killed before it could |
+| Retire-on-resume hook (`hooks/session-pid-registry.py`) | a usage limit doesn't kill the process, so the original is usually still alive when the limit resets; this maps session id → pid and retires the survivor, so a resume never forks into two owners of one transcript |
+| `claude_resume` (`scripts/claude_resume`) | resume a session by id, optionally sending a first prompt — how the supervisor hands a killed session its salvage instruction |
+
 ## Layout
 
 ```
@@ -90,6 +101,7 @@ agents/                 # subagent definitions (developer, system-analyst, code-
 skills/                 # skills (groom-ticket, orchestrate, code-review, architect-reminder,
                         #         stepping-away, summarize-issue, review-suggestions)
 workflows/              # Workflow scripts (ticket-review-panel)
+relaunch/               # session-continuity supervisor (launchd tick + installer)
 examples/CLAUDE.md      # Context Cascade template
 settings.example.json   # example hook wiring
 docs/
@@ -100,6 +112,7 @@ docs/
   harness_design.md        # the enforcement layer: hooks, gates, fail-open philosophy
   code-review.md           # the layered review method + how to grow it toward your stack
   suggestion-collector.md  # the self-improving loop
+  session-continuity.md    # surviving context exhaustion and usage limits
 ```
 
 ## Quick start
