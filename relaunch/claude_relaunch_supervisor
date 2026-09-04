@@ -121,6 +121,14 @@ PROBE_INTERVAL_FAR_SECONDS = 20 * 60
 PROBE_INTERVAL_NEAR_SECONDS = 5 * 60
 PROBE_NEAR_WINDOW_SECONDS = 60 * 60
 
+# How long a target session's transcript must be QUIET before its successor is
+# launched. Shorter than DEAD_AFTER_SECONDS on purpose: that constant answers
+# "is this session dead?" for the watchdog, where a false positive opens a
+# terminal against a live session; this one answers "has it stopped working?"
+# before a relaunch the session itself asked for, where the cost of waiting is
+# only delay. A session whose last subagent has reported goes quiet at once.
+SOURCE_QUIET_SECONDS = 5 * 60
+
 # The first message a RESUMED session receives. Kept free of double quotes,
 # backticks and '$' because it is interpolated into an AppleScript string that is
 # itself interpolated into a shell line.
@@ -433,6 +441,39 @@ def resume_blocked_reason(spec):
     return None
 
 
+def source_still_working(spec):
+    """Is the session this spec targets STILL PROCESSING TURNS? Reason, or None.
+
+    Applies to BOTH modes, because launching early is wrong in both — differently:
+
+      * resume — a live process means `--resume` would fork a COPY.
+      * pickup — a live source means two sessions working the same plan. Measured
+        2026-09-04: a session at 83% context wrote a `reason=context` spec while a
+        developer agent was still running. That spec carries `wait_until: "now"`,
+        so the supervisor launched on the very next tick and the successor came up
+        while the predecessor was still appending (23:33:59 launch, 23:34:16
+        append). The handoff flow says "wait until your subagents finish", but that
+        is prose addressed to the model, not a gate — so nothing enforced it.
+
+    TRANSCRIPT GROWTH is the signal, not process liveness: a wound-down session's
+    process stays alive sitting at its prompt, exactly like a usage-killed one, so
+    pid-alive cannot distinguish "working" from "finished". A session with a live
+    subagent keeps appending (task notifications land in the parent transcript),
+    so growth tracks the thing we actually care about.
+    """
+    session = spec["session_id"]
+    if transcript_path_for(session) is None:
+        return None  # nothing to race with; the mode-specific gate handles it
+    mtime = transcript_mtime(session)
+    if mtime is None:
+        return None
+    idle = time.time() - mtime
+    if idle < SOURCE_QUIET_SECONDS:
+        return (f"source session still appending "
+                f"({idle:.0f}s ago; needs {SOURCE_QUIET_SECONDS}s quiet)")
+    return None
+
+
 def retire(spec_path):
     """Move a consumed spec to done/, preserving any earlier spec for the session.
 
@@ -628,10 +669,24 @@ def tick(dry_run):
             if dry_run:
                 print(f"[dry-run] holding {spec['session_id'][:8]}: {note}")
             continue
+        # Never launch a successor while the source session is still working.
+        # The two modes diverge on what to DO about it, and the difference
+        # matters: a live resume target has revived itself, so its spec is moot
+        # and gets retired; a live pickup target is merely still winding down, so
+        # its spec is still wanted and must be HELD, not discarded.
+        mode = relaunch_mode(spec)
+        working = source_still_working(spec)
+        if working:
+            log("launch_held", session_id=spec["session_id"], mode=mode,
+                reason=working)
+            if dry_run:
+                print(f"[dry-run] holding {spec['session_id'][:8]}: {working}")
+            continue
+
         # Re-check liveness at the LAST moment for a resume: --resume on a running
         # session starts a copy, and the window between deciding and launching is
         # exactly when a human resumes the session by hand.
-        if relaunch_mode(spec) == "resume":
+        if mode == "resume":
             blocked = resume_blocked_reason(spec)
             if blocked:
                 log("resume_skipped", session_id=spec["session_id"],
