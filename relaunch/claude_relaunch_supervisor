@@ -965,9 +965,48 @@ def warn_if_hold_is_stuck(spec, reason):
     hours = held_for / 3600.0
     log("hold_stuck", session_id=session, held_hours=round(hours, 1),
         reason=reason)
-    notify("Claude relaunch supervisor",
-           f"{session[:8]} has been held {hours:.1f}h waiting on: {reason}. "
-           "Check whether those processes are still doing work.")
+
+    # THE ORCHESTRATOR DECIDES, NOT THE SUPERVISOR AND NOT THE OWNER. Whether
+    # those processes are live work or orphans is answerable only by the session
+    # that started them: it knows what it dispatched and what it stopped. So the
+    # finding goes to the source session when it can be reached, and to the owner
+    # only when it cannot.
+    told_session = tell_session_about_hold(session, hours, reason)
+    if not told_session:
+        notify("Claude relaunch supervisor",
+               f"{session[:8]} has been held {hours:.1f}h waiting on: {reason}. "
+               "Its window is unreachable — check those processes by hand.")
+    return True
+
+
+def tell_session_about_hold(session, hours, reason):
+    """Type the stuck hold into the source session's own window. True if sent.
+
+    Kept short so the client submits it: a long line arrives as a paste, whose
+    newline is inserted as text rather than submitting, and an Enter sent on a
+    fixed delay lands mid-paste and discards the whole thing. The Enter is sent
+    separately for the case where it did paste.
+    """
+    entry = rc.live_session_process(session)
+    guid = rc.iterm_guid(entry) if entry else None
+    open_terminals = rc.iterm_session_ids()
+    if not guid or open_terminals is None or guid not in open_terminals:
+        log("hold_stuck_unreachable", session_id=session, guid=guid,
+            terminals_listed=(open_terminals is not None))
+        return False
+    pid = (entry or {}).get("pid")
+    msg = (f"Relaunch supervisor: your successor has been held {hours:.1f}h "
+           f"waiting on background shells under pid {pid}. If that work is done "
+           "or was orphaned by a stopped subagent, kill them so the relaunch can "
+           "proceed; otherwise ignore this.")
+    try:
+        iterm_write(guid, msg)
+        time.sleep(SWITCH_SETTLE_SECONDS)
+        iterm_write(guid, "")
+    except (subprocess.SubprocessError, OSError) as exc:
+        log("hold_stuck_send_failed", session_id=session, error=str(exc))
+        return False
+    log("hold_stuck_sent", session_id=session, guid=guid, pid=pid)
     return True
 
 
