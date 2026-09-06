@@ -34,6 +34,46 @@ After gathering context, pause and ask: **is the proposed solution architectural
 
 **The output of this step can be "don't build this."** A well-reasoned decision not to build is better than a well-tested implementation of the wrong thing. But "don't build" must be justified by architectural unsoundness, not reluctance to do the work.
 
+## Step 1d: Is this one ticket, or an epic wearing a ticket's clothes?
+
+A ticket is one change, reviewable in one pass, shippable on its own. Work larger than that is an
+epic: a guiding design, a sequence of tickets, and a deployment plan that says what ships first and
+what turns on last.
+
+**Any one of these means the work is an epic. Stop drafting the ticket and draft the epic.**
+
+- The estimate is three or more sessions. That is a sequence, not a ticket.
+- The Approach needs an **internal ship order**. If you are numbering parts and saying which lands
+  first, you have written a deployment plan; its steps are the tickets.
+- The Approach names **parts that could ship separately** — a config, a service, a UI change, an
+  instrument, a migration.
+- **Invariants span the parts.** Rules that "every part obeys" are epic architecture, and they belong
+  in the guiding design where each ticket reads them.
+- The diff would plausibly exceed **~800 lines or ~15 files**.
+
+Reviewer defect-detection degrades as a diff grows — a property of the artifact, not a matter of
+taste. A large change is reviewed worse than the same change delivered in sequence, and it cannot be
+bisected.
+
+### What to produce instead
+
+1. **The epic directory** with a README carrying the guiding design, the Definition of Done, and the
+   ticket inventory.
+2. **A deployment plan in that README** — the ordered sequence, what each step ships, and what makes
+   each one safe to land alone. A part that cannot ship alone rides behind a flag committed disabled,
+   flipped by the last ticket in the sequence. Ordering exists so no step leaves the system in a
+   state the next step must rescue.
+3. **One ticket per step**, each groomed to this standard, each independently reviewable and
+   mergeable, each naming its predecessor.
+4. **A commitment for the sequence** — its own swim lane or its own sprint, so the orchestrator
+   dispatches the steps in order rather than a developer discovering the order inside a brief.
+
+An epic's ticket inventory is not its deployment plan. Filing siblings around a large central ticket
+decomposes along the axis of what other work exists, not the axis that governs delivery.
+
+Decomposition is a review-quality instrument and its value is spent at review time. Splitting after
+the review has happened does not recover it, which is why this gate is here and not later.
+
 ## Step 2: Refine Interactively
 
 **Ask the user questions.** The best tickets come from dialogue, not monologue. After your initial exploration, surface what you found and ask:
