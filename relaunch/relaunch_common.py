@@ -163,13 +163,17 @@ LIMIT_NAME_TO_KIND = {
 # Kinds that gate EVERY model on the account. Only these are worth waiting on; a
 # model-scoped limit is escaped by switching tier, not by waiting.
 #
-# `credits` — the monthly spend cap — belongs here and was missing until a
-# session hit it: "You've hit your monthly spend limit" stops Opus, Sonnet and
-# every other tier alike, because it is a cap on overage spend rather than on a
-# model's pool. Classified but treated as model-scoped, it made an exhausted
-# account look like a usable destination and made a switch look disruptive to
-# sessions that were in fact already stopped.
-SHARED_POOL_KINDS = frozenset({"session", "weekly", "credits"})
+# `credits` — the monthly spend cap — is deliberately NOT here, against the
+# intuition that a spend cap must gate everything. Measured 2026-09-05: one
+# account returned "You've hit your monthly spend limit" on Opus while Sonnet
+# subagents ran on that same account minutes later. The cap binds only on a
+# request that needs OVERAGE, so a model whose included pool still has room
+# never reaches it. Classing it as shared would take a working account out of
+# rotation, which fails in the more expensive direction than leaving it in.
+#
+# What would settle it: a credits rejection on a model whose own weekly pool is
+# known to be unexhausted. Until then this stays where the evidence puts it.
+SHARED_POOL_KINDS = frozenset({"session", "weekly"})
 
 # NOTE: there is deliberately no tier-preference table here any more. Choosing
 # which model a relaunch runs on is the CLIENT's job, from settings.json's

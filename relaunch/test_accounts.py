@@ -53,13 +53,21 @@ def test_pool_scoping(rc, store):
 
     # A shared pool gates every model, so it closes the account for everything.
     # Read as independent, it offered an exhausted account as a destination.
-    for shared in ("session", "weekly", "credits"):
+    for shared in ("session", "weekly"):
         record({shared: {"resets_at": future}})
         for need in ("session", "weekly", "opus", "sonnet", "credits"):
             check(f"{shared} spent -> closed for {need}",
                   rc.account_is_open("a@x", need)[0], False)
 
     # A model pool is narrower: Opus says nothing about Sonnet or the 5h pool.
+    # A monthly spend cap binds only where overage is needed, so it does not
+    # close the account for a model whose own pool still has room.
+    record({"credits": {"resets_at": future}})
+    check("credits spent -> closed for credits",
+          rc.account_is_open("a@x", "credits")[0], False)
+    check("credits spent -> still open for sonnet",
+          rc.account_is_open("a@x", "sonnet")[0], True)
+
     record({"opus": {"resets_at": future}})
     check("opus spent -> closed for opus", rc.account_is_open("a@x", "opus")[0], False)
     check("opus spent -> open for sonnet", rc.account_is_open("a@x", "sonnet")[0], True)
@@ -87,7 +95,7 @@ def test_credential_expiry(rc, store):
 def test_disruption_rule(rc):
     """Whether switching accounts harms sessions that are still working."""
     print("\ndisruption rule")
-    for kind in ("session", "weekly", "credits"):
+    for kind in ("session", "weekly"):
         check(f"{kind} shared -> switching harms nobody",
               rc.account_switch_disrupts_others(kind), False)
     for kind in ("opus", "sonnet", "fable"):
