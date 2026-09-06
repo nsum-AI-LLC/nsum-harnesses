@@ -909,6 +909,68 @@ def switch_model_in_place(session_id, guid, tier):
 BOOT_SETTLE_SECONDS = 12
 
 
+# A hold is correct while the source session is still working and wrong once it
+# is not. Nothing distinguishes the two from outside the process, so the hold is
+# bounded by TIME instead: past this, say so rather than holding in silence.
+STUCK_HOLD_SECONDS = 3600
+HOLD_STATE_PATH = os.path.join(rc.ROOT, "hold-state.json")
+
+
+def _hold_state():
+    try:
+        with open(HOLD_STATE_PATH) as fh:
+            state = json.load(fh)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_hold_state(state):
+    tmp = HOLD_STATE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(state, fh, indent=1)
+        os.replace(tmp, HOLD_STATE_PATH)
+    except OSError:
+        pass
+
+
+def warn_if_hold_is_stuck(spec, reason):
+    """Notify once when a spec has been held past the point of plausible work.
+
+    A held spec logs one line per tick and blocks nothing else, so an
+    unsatisfiable hold is invisible: the session it would relaunch never comes
+    back, and the log looks like the supervisor doing its job. The usual cause is
+    a background shell that outlived the agent which started it — a stopped
+    subagent does not take its shells with it, and a shell waiting on a condition
+    that can never be true waits forever.
+
+    Notifying does not release the hold. Whether those processes are real work is
+    the owner's call, and guessing wrong either kills live work or relaunches a
+    session on top of itself.
+    """
+    session = spec["session_id"]
+    state = _hold_state()
+    entry = state.get(session)
+    now = time.time()
+    if not entry:
+        state[session] = {"first_held": now, "warned": False}
+        _save_hold_state(state)
+        return False
+    held_for = now - entry.get("first_held", now)
+    if held_for < STUCK_HOLD_SECONDS or entry.get("warned"):
+        return False
+    entry["warned"] = True
+    _save_hold_state(state)
+    hours = held_for / 3600.0
+    log("hold_stuck", session_id=session, held_hours=round(hours, 1),
+        reason=reason)
+    notify("Claude relaunch supervisor",
+           f"{session[:8]} has been held {hours:.1f}h waiting on: {reason}. "
+           "Check whether those processes are still doing work.")
+    return True
+
+
 def launch_window(spec, tier=None):
     """Open a window running this spec's relaunch command. Returns its iTerm id.
 
@@ -1300,6 +1362,8 @@ def tick(dry_run):
                 reason=working)
             if dry_run:
                 print(f"[dry-run] holding {spec['session_id'][:8]}: {working}")
+            else:
+                warn_if_hold_is_stuck(spec, working)
             continue
 
         # Re-check liveness at the LAST moment for a resume: --resume on a running
