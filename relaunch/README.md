@@ -80,8 +80,17 @@ it next, and a session searching only its own repository will find that copy, or
 stale snapshot of it, and conclude the running supervisor is untracked.
 
 ```bash
-./install.sh          # installs, arms launchd, self-tests, dry-runs
+./install.sh              # installs, arms launchd, self-tests, dry-runs
+./install.sh --no-arm     # installs the code, leaves launchd alone
 ```
+
+Use `--no-arm` when the job is deliberately unloaded. Updating the code and
+starting the job are two different intentions, and someone who stopped the
+supervisor on purpose will still install a fix.
+
+The installer refuses to arm anything if the self-test fails. It used to print
+the failure and continue, which is how a self-test broken by a signature change
+went unnoticed across every install for two days.
 
 Then wire the hook per project — it is not installed globally, because it needs an
 entry in that project's `.claude/settings.json`:
@@ -101,6 +110,26 @@ cp ../hooks/session-pid-registry.py <project>/.claude/hooks/
 → `~/.claude/claude-relaunch`) means an in-place upgrade keeps a running job's specs,
 log and history exactly where they are. `install.sh` reuses an existing launchd label
 for the same reason — a second label would leave two supervisors racing one spec dir.
+
+## Which Python this runs under
+
+**The launchd job runs `/usr/bin/python3` — the system interpreter.** A background
+job has no conda environment and no user `PATH`, so it cannot be assumed to reach
+whatever `python3` means in a developer's shell. On current macOS the system
+interpreter is 3.9, while a project environment is often several versions ahead,
+and the same files here run under both: the tick under launchd, the CLI tools
+under whatever the shebang resolves to.
+
+**So everything in this directory must parse under the system interpreter.** A
+3.10-or-later construct — `match`, `X | Y` annotations, `tomllib` — makes the
+supervisor unimportable, and the failure is silent: launchd's tick dies at
+startup and sessions simply stop being relaunched, with nothing announcing why.
+`install.sh` refuses to install if any file fails to parse under
+`/usr/bin/python3`.
+
+The CLI tools carry `#!/usr/bin/env python3` so a person gets their own
+interpreter, which is fine — they are invoked interactively and the supervisor
+calls them as subprocesses rather than importing them.
 
 ## Safety rails
 
