@@ -34,6 +34,48 @@ After gathering context, pause and ask: **is the proposed solution architectural
 
 **The output of this step can be "don't build this."** A well-reasoned decision not to build is better than a well-tested implementation of the wrong thing. But "don't build" must be justified by architectural unsoundness, not reluctance to do the work.
 
+## Step 1c: What does this ticket move, and in what unit?
+
+**A sprint has ONE objective, stated in problem space, in exactly one sentence that names no
+mechanism** — `## Objective` in the sprint plan, with `## Acceptance Criteria` beneath it as its
+measurements. It is the ROOT: the thing every artifact of the sprint is compared against, and **the
+delta between the root and an artifact IS that artifact's framing**, which only has to be visible to
+be arguable. A framing that enters an artifact otherwise becomes an unchallengeable premise for
+everything downstream, because each step validates against its parent and nothing compares anything
+to the original problem.
+
+**The two tests an objective must pass, which every acceptance criterion inherits:**
+
+1. **Does it name a mechanism?** A file path, command name, product name, technique — **or a target
+   state of one of our own artifacts.** That last clause is the one that does the work: "the backlog
+   is whittled to a small tail" fails it, because the backlog is ours, so the sentence describes our
+   own machinery rather than the problem the sprint exists to solve.
+2. **Can it be satisfied without fixing anything?** Ask whether draining, deferring, suppressing, or
+   shrinking the measured population would satisfy it as written. If any would, it is a containment
+   objective and will license containment work for as long as it stands.
+
+Before writing acceptance criteria, answer both questions in the ticket body:
+
+1. **The sprint's `## Objective` this ticket serves, and which of its `## Acceptance Criteria` the
+   ticket moves.** Name both. The objective is the root; the criterion is a measurement OF that root
+   and is where a unit comes from, because the objective itself carries no number. This is one root
+   with its measurements, not a choice among competing parents. Fall back to an epic target or a spec
+   invariant only for work outside a sprint.
+2. **The number this ticket changes, written in the same unit that criterion uses.**
+
+**A ticket that serves the criterion but not the objective is the case this step exists to catch.**
+The criterion is a proxy, and a proxy can be moved by work that leaves the problem untouched —
+draining what it counts, narrowing the population it measures. State the contribution in the
+objective's terms as well as the criterion's; if it can only be stated in the criterion's, the ticket
+is aimed at the measurement rather than at the problem.
+
+A ticket whose number is in a different unit from its criterion's is measuring its own activity and
+needs re-scoping before dispatch. Every claim in such a ticket can be true; the mismatch appears only
+when someone compares the two units side by side.
+
+Answering "nothing currently on the board" is a real answer. It means the ticket is class work to file
+for later rather than scope to pull into the current sprint.
+
 ## Step 1d: Is this one ticket, or an epic wearing a ticket's clothes?
 
 A ticket is one change, reviewable in one pass, shippable on its own. Work larger than that is an

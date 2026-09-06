@@ -29,6 +29,13 @@ than proceeding on the half you can see.
 Name the DoD and the outcome it serves in your opening note, so the objective is stated rather
 than assumed.
 
+**The handoff also carries the SPRINT OBJECTIVE, quoted verbatim. Name that too, in the same note,
+unnarrowed.** That one sentence is the sprint's root, and your DoD is a slice of a slice of it —
+two inheritance hops, each of which can quietly re-aim the work. Read them together and say so if
+the DoD cannot be stated in the objective's terms: that gap is the most useful thing a fresh
+session can see, and nobody downstream of you can see it. **Do not author an objective if the
+handoff carries none** — say it carries none, work the DoD, and leave the root to the sprint plan.
+
 **Completing it does not end the session.** If context remains, continue with the next work the
 plan calls for. A cold restart rebuilds the warm context you are holding — live traces, design
 rationale, coordination state — so continuing is the higher-quality path, and the instinct to

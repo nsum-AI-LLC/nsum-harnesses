@@ -85,7 +85,16 @@ whatever investigation the review demands.
 
 **Do not** read every spec, run the whole suite, or explore the codebase aimlessly before invoking the
 skill. The skill directs the investigation; your role is to drive it to completion, not to improvise a
-parallel one.
+parallel one. Design review is the exception that directs reading: it sends you to the ticket, its
+specs, and the codebase to find where the requirement belongs, and that reading is required.
+
+**Your brief quotes the sprint's `## Objective` verbatim, beside the outcome line.** That sentence is
+the sprint's ROOT, and `design-review` § 1 needs it: you state the root, then the outcome this work
+must produce, and **the delta between them is the framing under review**. Prefer the brief's copy over
+the plan in your worktree, which may sit at an older commit. If the brief carries no objective line,
+the sprint has none — proceed on the ticket, its epic and its Key Specs, and record in your verdict
+that no root was available. **Do not author one.** A reviewer who supplies the standard has let the
+review's own side write the thing it is judged against.
 
 ## Step 2: Execute the review
 

@@ -123,6 +123,16 @@ For each batch (group independent tickets for parallel dispatch; serialize depen
 Launch a `developer` subagent with a one-sentence assignment; it reads its own context. Independent
 tickets → parallel Task calls in one message, each in its own worktree. Dependent tickets → serialize.
 
+**The assignment also quotes the sprint's `## Objective` verbatim, with its sprint number:**
+`Sprint {N}'s objective, verbatim: "{the one sentence}".` That is the sprint's ROOT and the one
+carve-out to the rule against putting committed-doc content in a prompt — quoted, never summarized,
+because divergence between a quote and its source is two strings that differ, while a summary's
+staleness is invisible. It does not replace the ticket: the ticket says what to build, the objective
+says what problem the building serves, and the developer is expected to say so when the two come
+apart. **Where the sprint has no objective, omit the line. Never synthesize one** — an objective
+written at dispatch time is the dispatcher supplying the standard its own work will be judged
+against. (`groom-ticket` Step 1c carries the template and the two tests.)
+
 **Docs-only / planning-only tickets — do NOT dispatch to a worktree subagent; write them yourself.** If a
 ticket's whole deliverable is a planning/tracking doc, implement it directly in the primary tree: a
 worktree subagent structurally *cannot* persist a planning doc (the worktree copy is blocked by
@@ -146,7 +156,15 @@ After the developer reports done: verify the branch was pushed, open a PR agains
 the URL to the user. **Stop — do not merge.**
 
 ### Phase 3 — Code review
-Launch a `code-reviewer` subagent: `Review PR #{N} for {ticket-id}: {description}.` It invokes the
+Launch a `code-reviewer` subagent with the PR, the sprint objective quoted verbatim, and the outcome:
+`Review PR #{N} for {ticket-id}. Sprint {N}'s objective, verbatim: "{the one sentence}". The outcome
+this must produce: {the requirement, no mechanism named}.` **Take the outcome from the objective as
+its root, not from the ticket alone** — a requirement re-derived per dispatch out of the ticket
+inherits whatever framing the ticket carries, and the brief then hands the reviewer that framing as
+its premise. **The objective line sits beside the outcome line and does not replace it:** the
+objective is the sprint's root, the outcome is this ticket's, and `design-review` § 1 turns on the
+delta between them being visible. Omit the objective line when the sprint has none; never synthesize
+one. It invokes the
 `code-review` skill (three layers + non-negotiable checklist), posts findings as a PR comment, and reports
 the categorized findings back to you. The reviewer renders **no overall verdict** — it reports; you decide.
 
@@ -178,8 +196,10 @@ rather than branching around it. **Never `git worktree remove`/`prune`** mid-fli
 editor. Non-trivial fixes → re-review with another `code-reviewer`. Trivial fixes → verify yourself by
 reading the diff.
 
-**Every fix brief leads with the outcome** the ticket must produce, stated with no mechanism named,
-and carries the findings second. A brief scoped to the findings alone narrows the developer, the
+**Every fix brief leads with the outcome** the ticket must produce, stated with no mechanism named
+and rooted in the sprint's `## Objective` rather than in the ticket's proposed approach — same terms
+and same fallback as Phase 3 — and carries the findings second. A fix round is where scope creeps
+toward whatever closes the findings, so the root is worth more here rather than less. A brief scoped to the findings alone narrows the developer, the
 reviewer and the orchestrator together.
 
 **The cycle is capped at two fix rounds.** Each of these is a `⟦DESIGN-REVIEW: UNSOUND⟧` condition

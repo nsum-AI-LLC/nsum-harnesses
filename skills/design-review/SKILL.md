@@ -12,9 +12,13 @@ not whether the tests pass. A change can be flawless and still be the wrong thin
 each time. An approach that was sound against the first draft can be refuted by what later
 rounds discover, and the round that discovers it is the round that must say so.
 
-## 1. State the outcome with no mechanism in it
+## 1. State the root, then the outcome, with no mechanism in either
 
-Read the ticket, its epic, and the specs in its § Key Specs. Then write the outcome the work
+**Read the current sprint's `## Objective` first** — the one problem-space sentence in the sprint
+plan. That sentence is the ROOT: it is the only statement here not derived from something under
+review. Quote it verbatim. (`groom-ticket` Step 1c carries the template and the two tests.)
+
+Then read the ticket, its epic, and the specs in its § Key Specs, and write the outcome this work
 must produce **as a sentence containing no mechanism** — no file, no surface, no gate, no
 command.
 
@@ -24,11 +28,25 @@ That is an outcome. "Gate the pytest invocation surface" is a mechanism. "Stop t
 emitting thousands of exceptions" is an outcome; "drain the anchored-title band" is a
 mechanism.
 
-**If the outcome cannot be stated without naming the mechanism, the ticket's framing has been
-inherited and this review has not started yet.** A ticket names one approach. It is one
-candidate, written before the code was read, and it is the thing under review — not the
-premise of the review. A title that names a mechanism is an approach wearing a requirement's
-clothes.
+**State both, because the delta between them is the framing.** The root is not the outcome — an
+objective spans a sprint, a ticket's outcome is narrower — and collapsing either into the other
+loses the ticket. What the root supplies is a standard to compare the outcome against that the
+artifact under review did not author.
+
+**Two ways a framing has been inherited. Each is `⟦DESIGN-REVIEW: UNSOUND⟧`.**
+
+- **The outcome cannot be stated without naming the mechanism.** A ticket names one approach. It
+  is one candidate, written before the code was read, and it is the thing under review — not the
+  premise of the review. A title that names a mechanism is an approach wearing a requirement's
+  clothes.
+- **The outcome cannot be stated in the root's terms, or the work could fully succeed while the
+  root is no closer.** Then it is aimed at something other than the problem the sprint exists to
+  solve, however well the ticket argues for itself. Name the delta; that is the refutation.
+
+**When no objective exists** — a sprint predating the field, or a PR opened outside a sprint —
+derive the outcome from the ticket, its epic and its Key Specs as above, and record in the verdict
+that no root was available. Do not supply one yourself: an objective authored by the reviewer is
+the artifact providing its own standard, which is the failure this section exists to prevent.
 
 ## 2. Enumerate the chokepoints from the code, before judging the approach
 

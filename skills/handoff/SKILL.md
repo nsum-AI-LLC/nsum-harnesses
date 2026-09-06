@@ -55,6 +55,9 @@ language, no commit shas or ticket ids; those belong in the lists below.>
 - <the decision, and what settled it>
 <!-- /SESSION_SUMMARY -->
 
+## Sprint Objective
+<the sprint's ## Objective, quoted verbatim, with its sprint number — omit if the sprint has none>
+
 ## Definition of Done
 <the concrete, checkable outcome list for the next session, and what is deliberately out>
 ```
@@ -67,9 +70,16 @@ produces an unnecessary relay. If the remaining work genuinely fits one session,
 explicitly and say do not hand off part-way.
 
 **A DoD is completion, not success.** It measures whether the list got done. Whether the work
-solved the problem is a separate question, and a DoD met in full is not evidence of it. Where
-the project states an objective, carry it into the DoD un-narrowed so the successor is checking
-against the problem rather than against your list.
+solved the problem is a separate question, and a DoD met in full is not evidence of it.
+
+**So quote the sprint's `## Objective` verbatim beside the DoD — never summarized, and never
+narrowed to the session's slice.** That one sentence is the sprint's root, and a DoD is inherited
+and re-narrowed at every hop, so a root paraphrased into the DoD stops being a root after one
+handoff. This channel matters more than the others: an orientation hook that shows the objective
+on a normal turn does not fire during autonomous work, so a `/pickup` chain has no other path to
+it. It composes with keeping the sprint whole while bounding only the session slice — by making
+the un-narrowed thing explicit instead of leaving the successor to re-derive it from the plan
+header.
 
 **A row count is rarely a DoD.** "Resolve N items", "get the queue under M", "clean up the
 backlog" describe labour, not a capability. Re-scope to the thing that stops the items being
