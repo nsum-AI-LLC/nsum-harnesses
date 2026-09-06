@@ -15,6 +15,12 @@ kept in check, especially in long-running development loops:
   trust one to make — or to scrutinize — architectural decisions.
 - **Amnesia.** A new session starts from scratch, and the more mature a project is, the worse a "cold
   start" gets. Strategy, architecture, and established conventions have to be re-learned every session.
+  The `handoff` and `pickup` skills are the answer to this one: a session ends with its context
+  exhausted rather than its work finished, so it writes its own hand-off — one file per session,
+  never a shared one — naming what its successor must read and a definition of done sized to
+  what it actually achieved. The successor is required to open every named file before starting,
+  because the one thing a cold start cannot reconstruct by reasoning is what the last session
+  learned. With `relaunch/` armed, the chain continues without anyone present.
 - **Compounding errors.** Without correcting for the above, an early mistake in a long autonomous run
   snowballs into a wasted session or a latent architectural flaw.
 - **Completion drive.** The model wants to deliver what you asked for. If you give up control of
