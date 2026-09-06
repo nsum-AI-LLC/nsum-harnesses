@@ -176,7 +176,20 @@ branches strand commits the PR never sees and survive merge as orphans. If the P
 another worktree, push to it from the orchestrator (`git push origin <source>:refs/heads/<pr-branch>`)
 rather than branching around it. **Never `git worktree remove`/`prune`** mid-flight — it can crash an open
 editor. Non-trivial fixes → re-review with another `code-reviewer`. Trivial fixes → verify yourself by
-reading the diff. Repeat until clean.
+reading the diff.
+
+**Every fix brief leads with the outcome** the ticket must produce, stated with no mechanism named,
+and carries the findings second. A brief scoped to the findings alone narrows the developer, the
+reviewer and the orchestrator together.
+
+**The cycle is capped at two fix rounds.** Each of these is a `⟦DESIGN-REVIEW: UNSOUND⟧` condition
+that ends it rather than producing another brief: a finding that names the approach rather than the
+code, regardless of severity label; the same concern class appearing in two rounds with different
+instances; a finding dispositioned as a documented limitation which, restated, is the requirement;
+two consecutive rounds landing their changes mostly in tests; or two fix rounds having run. The cap
+counts rounds, not findings — a PR still producing findings after two is wrong-layered or too large
+to review in one pass, and reaching it is itself the verdict. UNSOUND returns the ticket to grooming
+for re-scoping against the outcome.
 
 ### Phase 6 — Ready to merge
 Report "PR #{N} for {ticket-id} is ready to merge." **Do not merge.** List any post-merge (Ops) criteria.
@@ -199,8 +212,9 @@ state.
   origin/<branch>..HEAD`) and push it (`git push origin <sha>:refs/heads/<pr-branch>`) before
   re-dispatching, so you don't rebuild work that already exists. Then fix the ticket (if the spec was
   wrong) or re-dispatch with corrected instructions.
-- **Review finds a design-level (Layer 1) issue:** stop the fix cycle. Escalate to the user with the
-  concern and proposed alternatives (the door-knock format above). Don't proceed until it's resolved.
+- **A design-level issue surfaces** (`⟦DESIGN-REVIEW: UNSOUND⟧`, an approach concern reaching you with
+  a severity label, or the two-round cap): stop the fix cycle. The ticket returns to grooming for
+  re-scoping against the outcome, carrying the refutation and the layer the requirement belongs to.
 - **CI fails:** do not declare ready. Investigate whether it's a test issue or an implementation issue;
   fix before proceeding.
 - **Merge conflict:** rebase onto the main branch and resolve properly. After a parent was squash-merged,

@@ -12,8 +12,29 @@ its callers and callees** — and deliberately leaves the framework-specific rul
 
 ## Core philosophy
 
-**Challenge the approach before verifying the implementation.** Correct code that solves the wrong
-problem is still wrong.
+**The approach is settled before this skill runs.** The `design-review` skill decides whether the
+change should exist in this form and emits `⟦DESIGN-REVIEW: SOUND⟧`. Confirm that token for the
+current head before reading the diff. This skill verifies the implementation of an approach
+already judged right.
+
+**You own whether this ships correctly, and you can send it back to design review at any point.**
+If the architecture looks wrong once you are inside the code, stop and hand it back — an available
+and expected move, not an escalation and not a failure of the review. Handing it back is how you
+exercise that ownership, not how you set it down; a reviewer who sees the approach is wrong and
+reports severities instead has kept the work and lost the outcome. Reach for it on: a route that
+reaches the same outcome and this change cannot gate; a layer nearer the thing being controlled
+that would own the concern; a better layer named in the diff or ticket and declined on effort,
+packaging or timeline; an existing seam already carrying it; a limitation being documented which,
+restated, is the requirement; a defect whose instances keep multiplying as you look for them.
+**Do not give any of those a severity instead** — a severity is an instruction to patch, so a
+refutation filed as one closes a single route while the approach stands.
+
+**The delta is the whole change, on every round.** On a fix round, scope is the PR against the
+ticket's outcome, never the previous round's finding list.
+
+**Exhaust a finding's class before reporting it.** A finding is a class, not an instance. Reporting
+the first instance produces a round that closes one and a next round that finds another, which is
+how a bounded defect and an unbounded surface become indistinguishable.
 
 **Review the delta, not just the destination.** A change is a *modification to existing behavior*. The
 question is never only "is the new code good?" — it is "is this *change* intentional, complete, and safe
@@ -49,49 +70,6 @@ Layer 3: SURVIVES.  → What happens when things go wrong?
 
 Skipping Layer 1 to dive straight into Layer 2 is the single most common review failure — you end up
 polishing a well-built answer to the wrong question.
-
----
-
-# Layer 1 — SHOULD (design review)
-
-Before reading the code line by line, answer: **should this change exist in this form?**
-
-### 1.1 Gather context
-
-1. **Read the linked work item / ticket.** Its acceptance criteria define what "done" means. If you
-   cannot determine what work this change implements, say so explicitly in the review — that is itself a
-   finding.
-2. **Read the change description.** What does the author claim it does? Does that match the acceptance
-   criteria?
-3. **Read the surrounding planning/spec context** the ticket points to, if any.
-4. **Fetch the full diff** to a file and read it with the Read tool — never review from a skimmed
-   terminal scroll.
-
-### 1.2 "Does the platform already solve this?"
-
-Before accepting custom logic, check whether the language, framework, standard library, or an already-
-imported dependency provides a built-in solution. Hand-rolled versions of things the platform already
-does are a maintenance liability and usually buggier than the built-in.
-
-### 1.3 Alternatives
-
-For any non-trivial change: the ticket or spec usually records the chosen approach and the alternatives.
-Scrutinize the reasoning with fresh eyes. Is any deviation from the intended design justified? What would
-a senior engineer who *disagreed* with this approach propose instead — and is there a reason that's wrong?
-
-### 1.4 Complexity budget
-
-Does the solution's complexity match the problem's? Could it be done with less code, fewer moving parts?
-What's the maintenance burden in two years?
-
-### 1.5 Consumer verification — "who reads what this writes?"
-
-For any code that persists or emits state (records, events, cache entries, files, messages): identify the
-specific consumer. **If nothing reads the output, the code is dead on arrival** — flag it. This is the
-first half of impact tracing: where does this change's output *go*?
-
-**Layer 1 output:** either "approach is sound — proceed to Layer 2" or "stop — the design needs
-discussion." Don't review the implementation of an approach you believe is wrong.
 
 ---
 
@@ -245,8 +223,8 @@ return the full text instead. Sign off as Claude with the model name.
 ## Summary
 [1–2 sentences: what this does]
 
-## Design Assessment (Layer 1)
-[Approach, alternatives considered, complexity]
+## Design verdict
+[The `⟦DESIGN-REVIEW: SOUND⟧` token and the head SHA it was issued against]
 
 ## Implementation Findings (Layer 2)
 ### Critical / High

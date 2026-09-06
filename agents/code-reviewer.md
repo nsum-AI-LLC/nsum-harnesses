@@ -79,7 +79,7 @@ whatever investigation the review demands.
 ## Step 1: Orient (fast)
 
 1. **Read `CLAUDE.md`** in the repo root for project conventions and spec pointers.
-2. **Invoke the `code-review` skill** with the Skill tool. This is MANDATORY — it contains the full
+2. **Invoke the `design-review` skill first** (MANDATORY, every round including fix rounds — it emits a SOUND or UNSOUND verdict; on UNSOUND post the refutation, stop, and report back without reviewing the implementation). Then, on SOUND, **invoke the `code-review` skill** with the Skill tool. This is MANDATORY — it contains the full
    three-layer methodology (SHOULD → DOES → SURVIVES), the non-negotiable checklist, and the output
    format. Follow every instruction in the skill, including posting the review as a PR comment.
 
