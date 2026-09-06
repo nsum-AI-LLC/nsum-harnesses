@@ -35,10 +35,16 @@ else
 fi
 
 mkdir -p "$BIN" "$ROOT/specs" "$ROOT/done"
+# Stored account credentials. 0700 because the files inside hold OAuth tokens;
+# they are written 0600 by the tool itself.
+mkdir -p "$ROOT/accounts" && chmod 700 "$ROOT/accounts"
 
 install -m 0755 "$SRC/claude_relaunch_supervisor" "$BIN/claude_relaunch_supervisor"
 install -m 0755 "$SRC/claude_write_relaunch_spec" "$BIN/claude_write_relaunch_spec"
 install -m 0755 "$SRC/claude_usage_meter"         "$BIN/claude_usage_meter"
+# Multi-account rotation. The supervisor shells out to this rather than
+# importing it, so it has to be executable and beside the others.
+install -m 0755 "$SRC/claude_account"             "$BIN/claude_account"
 # Shared library — the supervisor and the spec writer both import it, so
 # omitting it leaves an install that cannot even start.
 install -m 0755 "$SRC/relaunch_common.py"         "$BIN/relaunch_common.py"
@@ -115,6 +121,13 @@ echo
 echo "== NOTE: the retire-on-resume half is a SessionStart hook. Wire it per project:"
 echo "     cp hooks/session-pid-registry.py <project>/.claude/hooks/"
 echo "   then add it to SessionStart in that project's .claude/settings.json."
+echo
+echo
+echo "== multi-account rotation (optional) =="
+echo "   Two accounts let a session that hits a 5-hour, weekly or spend limit"
+echo "   carry on instead of waiting for the reset. To set it up:"
+echo "     $BIN/claude_account setup"
+echo "   It reports what is saved and names the next step each time you run it."
 echo
 echo "== dry-run tick (decisions only): =="
 /usr/bin/python3 "$BIN/claude_relaunch_supervisor" --dry-run

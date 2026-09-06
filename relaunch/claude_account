@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""Store and switch between Claude Code accounts on macOS.
+
+Claude Code keeps one account's state in two places, and BOTH must move together
+or the CLI ends up with one account's tokens and another's profile:
+
+  * the OAuth tokens, in the login Keychain under service "Claude Code-credentials"
+    with the account name set to $USER;
+  * the account identity, in ~/.claude.json under the single "oauthAccount" key,
+    which is overwritten on every /login.
+
+This tool captures the pair under the account's email address, and swaps them
+back in on demand. It never prints a token. Stored blobs are 0600 inside a 0700
+directory, outside any git checkout.
+
+A running Claude Code process caches its credentials, so a switch is only picked
+up by a NEWLY launched session. Switching does not, and cannot, move a session
+that is already running onto another account.
+
+Subcommands:
+  setup                guided first run: what is saved, and what to do next
+  capture              save the account that is logged in right now
+  list                 stored accounts, with token expiry and known limits
+  current              print the email of the account logged in right now
+  switch <email>       make a stored account the active one
+  check <email>        is the stored credential still usable?
+  note-limit <email> <kind> <resets_at_epoch>
+                       record that a pool is spent (written by the supervisor)
+  clear-limit <email> [kind]
+                       forget a recorded limit
+  set-policy <email> <model> [fallback,...]
+                       declare which models this account prefers
+  live-sessions        how many Claude Code sessions are running
+"""
+
+import datetime
+import json
+import os
+import pwd
+import shlex
+import subprocess
+import sys
+import tempfile
+
+SECURITY = "/usr/bin/security"
+SERVICE = "Claude Code-credentials"
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+SETTINGS_JSON = os.path.expanduser("~/.claude/settings.json")
+# Where the supervisor keeps its state. Mirrors relaunch_common.relaunch_root()
+# so this tool runs standalone: it is invoked as a subprocess by the supervisor
+# and directly by a person, and importing the library for one function would
+# make the second case depend on the first being installed.
+LEGACY_ROOT_NAMES = ("willcall-relaunch",)
+
+
+def _relaunch_root():
+    override = os.environ.get("CLAUDE_RELAUNCH_ROOT")
+    if override:
+        return override
+    for legacy in LEGACY_ROOT_NAMES:
+        candidate = os.path.expanduser(os.path.join("~/.claude", legacy))
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.expanduser("~/.claude/claude-relaunch")
+
+
+ROOT = _relaunch_root()
+STORE = os.path.join(ROOT, "accounts")
+# Append-only record of when the machine's active account changed. The usage
+# meter reads it to attribute token burn to the account that actually spent it:
+# a trailing 5-hour window can span a switch, and the server counts each
+# account's usage separately.
+SWITCH_LOG = os.path.join(ROOT, "account-switches.jsonl")
+TIMEOUT = 10
+
+# The pools a switch can help with. A model-scoped pool (opus/sonnet/fable) is
+# answered by /model, which is cheaper and does not need a relaunch.
+SHARED_POOLS = ("session", "weekly")
+
+
+class AccountError(RuntimeError):
+    pass
+
+
+# ------------------------------------------------------------------ keychain
+
+def keychain_account():
+    """The Keychain item's account name, matching what Claude Code writes."""
+    return os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+
+
+def keychain_read():
+    """The raw credential JSON string, or None when no item exists."""
+    proc = subprocess.run(
+        [SECURITY, "find-generic-password", "-a", keychain_account(),
+         "-w", "-s", SERVICE],
+        capture_output=True, text=True, timeout=TIMEOUT)
+    if proc.returncode == 44:          # errSecItemNotFound
+        return None
+    if proc.returncode != 0:
+        raise AccountError(f"keychain read failed: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def keychain_write(value, service=SERVICE):
+    """Replace the credential item. `value` is the raw JSON string.
+
+    Delivered over stdin rather than argv so the secret never appears in the
+    process table, and hex-encoded (-X) so no quoting of the JSON is needed.
+    """
+    line = "add-generic-password -U -a {} -s {} -X {}\n".format(
+        shlex.quote(keychain_account()),
+        shlex.quote(service),
+        value.encode("utf-8").hex())
+    proc = subprocess.run([SECURITY, "-i"], input=line,
+                          capture_output=True, text=True, timeout=TIMEOUT)
+    if proc.returncode != 0:
+        raise AccountError(f"keychain write failed: {proc.stderr.strip()}")
+
+
+# --------------------------------------------------------------- claude.json
+
+def read_claude_json():
+    with open(CLAUDE_JSON, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _write_oauth_once(block):
+    """One read-modify-write of ~/.claude.json's oauthAccount.
+
+    Written to a temp file in the same directory and renamed, so an interrupted
+    write cannot leave a truncated config behind. The read and the write are kept
+    adjacent to make the window a concurrent writer can land in as small as
+    possible.
+    """
+    data = read_claude_json()
+    data["oauthAccount"] = block
+    directory = os.path.dirname(CLAUDE_JSON)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".claude.json.swap.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CLAUDE_JSON)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def write_oauth_account(block, attempts=3):
+    """Swap oauthAccount and CONFIRM it stuck.
+
+    A running Claude Code rewrites ~/.claude.json on its own schedule (usage
+    counters, project state), so a plain read-modify-write can be clobbered
+    between our read and our rename. Losing that race silently would leave the
+    Keychain holding one account and the config naming another — the exact
+    split-brain this tool exists to prevent — so the write is verified and
+    retried, and a persistent failure is raised rather than reported as success.
+    """
+    want = block.get("accountUuid")
+    for attempt in range(1, attempts + 1):
+        _write_oauth_once(block)
+        if current_oauth().get("accountUuid") == want:
+            return attempt
+    raise AccountError(
+        "~/.claude.json kept reverting oauthAccount after "
+        f"{attempts} attempts — another Claude Code process is writing it. "
+        "The Keychain now holds the new account's tokens while the config "
+        "names the old one; re-run this switch with no session starting up.")
+
+
+def current_oauth():
+    return read_claude_json().get("oauthAccount") or {}
+
+
+def current_email():
+    return current_oauth().get("emailAddress")
+
+
+# ------------------------------------------------------------------- storage
+
+def store_path(email):
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    safe = email.replace("/", "_")
+    return os.path.join(STORE, f"{safe}.json")
+
+
+def load_record(email):
+    path = store_path(email)
+    if not os.path.exists(path):
+        raise AccountError(f"no stored account for {email} (run: capture)")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_record(record):
+    path = store_path(record["email"])
+    fd, tmp = tempfile.mkstemp(dir=STORE, prefix=".acct.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
+def stored_emails():
+    if not os.path.isdir(STORE):
+        return []
+    return sorted(f[:-5] for f in os.listdir(STORE) if f.endswith(".json"))
+
+
+# --------------------------------------------------------------- credentials
+
+def token_expiry(record):
+    """(access_expiry, refresh_expiry) as aware datetimes, either may be None."""
+    oauth = (record.get("credentials") or {}).get("claudeAiOauth") or {}
+    out = []
+    for key in ("expiresAt", "refreshTokenExpiresAt"):
+        ms = oauth.get(key)
+        out.append(datetime.datetime.fromtimestamp(ms / 1000,
+                                                   datetime.timezone.utc)
+                   if isinstance(ms, (int, float)) and ms > 0 else None)
+    return tuple(out)
+
+
+def credential_usable(record):
+    """(usable, reason). Usable means the refresh token has not expired.
+
+    The access token expiring is normal and Claude Code refreshes it on start.
+    The refresh token expiring is terminal: swapping that blob in produces a
+    session sitting at a login prompt, so it is reported rather than launched.
+    """
+    _, refresh_exp = token_expiry(record)
+    if refresh_exp is None:
+        return True, "no refresh expiry recorded"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if refresh_exp <= now:
+        return False, f"refresh token expired {refresh_exp:%Y-%m-%d %H:%M}Z"
+    return True, f"refresh token valid to {refresh_exp:%Y-%m-%d %H:%M}Z"
+
+
+def limit_state(record):
+    """(blocked_pools, earliest_reset) from the recorded limit notes."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    blocked, earliest = [], None
+    for kind, entry in (record.get("limits") or {}).items():
+        resets = entry.get("resets_at")
+        if not isinstance(resets, (int, float)):
+            continue
+        when = datetime.datetime.fromtimestamp(resets, datetime.timezone.utc)
+        if when > now:
+            blocked.append(kind)
+            earliest = when if earliest is None else min(earliest, when)
+    return blocked, earliest
+
+
+def read_switch_log():
+    """Every recorded account change, oldest first. Never raises."""
+    entries = []
+    try:
+        with open(SWITCH_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry.get("epoch"), (int, float)):
+                    entries.append(entry)
+    except OSError:
+        return []
+    entries.sort(key=lambda e: e["epoch"])
+    return entries
+
+
+def log_switch(previous, current, detected=False):
+    """Record that the active account became `current`.
+
+    `detected` marks a change this tool did not perform — a /login the owner ran
+    by hand. Its epoch is when the change was NOTICED, not when it happened, so
+    burn in the gap is attributed to the outgoing account. The gap is bounded by
+    how often something calls capture (the supervisor, every tick).
+    """
+    if previous == current:
+        return False
+    os.makedirs(os.path.dirname(SWITCH_LOG), exist_ok=True)
+    entry = {"epoch": int(datetime.datetime.now().timestamp()),
+             "from": previous, "to": current, "detected": bool(detected)}
+    with open(SWITCH_LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    return True
+
+
+def last_known_active():
+    """The account the log says is active, or None when the log is empty."""
+    entries = read_switch_log()
+    return entries[-1]["to"] if entries else None
+
+
+def apply_tier_policy(record):
+    """Write an account's declared model order into ~/.claude/settings.json.
+
+    THE MODEL POLICY BELONGS TO THE ACCOUNT, NOT THE MACHINE. A large plan can
+    afford to run a cheaper model by default and keep the expensive one as
+    headroom; a small plan is better spent going straight to the model the work
+    needs. Both accounts share one settings file, so the policy has to travel
+    with the switch or every session lands on whichever account was configured
+    last.
+
+    Nothing is invented here. The order is only what the owner declared for that
+    account, and an account with no declared policy leaves settings untouched —
+    the supervisor reads this file back through `tier_preference()`, so a guess
+    written here would become a preference the owner never expressed.
+    """
+    policy = record.get("tier_policy")
+    if not isinstance(policy, dict) or not policy.get("model"):
+        return None
+    try:
+        with open(SETTINGS_JSON, encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise AccountError(f"cannot read {SETTINGS_JSON}: {exc}")
+
+    settings["model"] = policy["model"]
+    fallback = policy.get("fallbackModel")
+    if fallback:
+        settings["fallbackModel"] = list(fallback)
+    else:
+        settings.pop("fallbackModel", None)
+
+    directory = os.path.dirname(SETTINGS_JSON)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".settings.swap.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+        os.replace(tmp, SETTINGS_JSON)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return policy
+
+
+SESSION_PIDS = os.path.join(ROOT, "session-pids.json")
+
+
+def live_sessions(exclude_pid=None):
+    """[(session_id, pid)] for Claude Code sessions running right now.
+
+    A SWITCH IS NOT PRIVATE TO THE SESSION THAT MAKES IT. The account is machine
+    state and a running client re-reads it: measured 2026-09-05, a switch held
+    for eight seconds killed two subagents in another session with the incoming
+    account's 429. Anything that changes the account has to know who else is
+    working first.
+    """
+    try:
+        with open(SESSION_PIDS, encoding="utf-8") as fh:
+            registry = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for session_id, entries in (registry or {}).items():
+        for entry in entries if isinstance(entries, list) else [entries]:
+            pid = entry.get("pid")
+            if not isinstance(pid, int) or pid == exclude_pid:
+                continue
+            try:
+                os.kill(pid, 0)          # signal 0: liveness only, no effect
+            except OSError:
+                continue
+            out.append((session_id, pid))
+    return out
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_capture(args):
+    oauth = current_oauth()
+    email = oauth.get("emailAddress")
+    if not email:
+        raise AccountError("no account is logged in (~/.claude.json has no "
+                           "oauthAccount) — run /login first")
+    blob = keychain_read()
+    if blob is None:
+        raise AccountError(f"{email} is named in ~/.claude.json but the "
+                           "Keychain holds no credentials for it")
+    try:
+        credentials = json.loads(blob)
+    except json.JSONDecodeError as exc:
+        raise AccountError(f"keychain credential is not JSON: {exc}")
+
+    existing = {}
+    if os.path.exists(store_path(email)):
+        existing = load_record(email)
+    record = {
+        "email": email,
+        "account_uuid": oauth.get("accountUuid"),
+        "organization_uuid": oauth.get("organizationUuid"),
+        "rate_limit_tier": oauth.get("organizationRateLimitTier"),
+        "oauth_account": oauth,
+        "credentials": credentials,
+        "captured_at": int(datetime.datetime.now().timestamp()),
+        # Limit notes belong to the account, not to this capture, so a re-capture
+        # after a fresh login must not forget that a pool is still spent.
+        "limits": existing.get("limits") or {},
+        # The model policy is the owner's declaration, not observed state, so a
+        # re-capture never rewrites it from whatever settings.json happens to say.
+        "tier_policy": existing.get("tier_policy"),
+    }
+    for carried in ("window_ceiling_tokens", "ceiling_reading_at",
+                    "ceiling_source"):
+        if carried in existing:
+            record[carried] = existing[carried]
+    path = save_record(record)
+
+    # A /login run by hand changes the active account without going through
+    # this tool. Capture is called often enough (every supervisor tick) to
+    # notice, and the meter needs the boundary or it bills one account for the
+    # other's burn.
+    known = last_known_active()
+    if known != email:
+        log_switch(known, email, detected=True)
+
+    _, reason = credential_usable(record)
+    print(f"captured {email} ({record['rate_limit_tier']}) -> {path}")
+    print(f"  {reason}")
+    return 0
+
+
+def cmd_list(args):
+    active = current_email()
+    emails = stored_emails()
+    if not emails:
+        print(f"no stored accounts in {STORE}")
+        print("active (not yet captured):", active or "none")
+        return 0
+    for email in emails:
+        record = load_record(email)
+        usable, reason = credential_usable(record)
+        blocked, earliest = limit_state(record)
+        mark = "*" if email == active else " "
+        print(f"{mark} {email}  {record.get('rate_limit_tier') or '?'}")
+        print(f"    credential: {'ok' if usable else 'UNUSABLE'} — {reason}")
+        if blocked:
+            print(f"    blocked: {', '.join(sorted(blocked))} "
+                  f"until {earliest:%Y-%m-%d %H:%M}Z")
+        else:
+            print("    blocked: nothing recorded")
+    if active and active not in emails:
+        print(f"\nactive account {active} is NOT captured — run: capture")
+    return 0
+
+
+def cmd_current(args):
+    email = current_email()
+    if not email:
+        print("no account logged in")
+        return 1
+    oauth = current_oauth()
+    print(f"{email}  {oauth.get('organizationRateLimitTier') or '?'}  "
+          f"{str(oauth.get('accountUuid'))[:8]}")
+    return 0
+
+
+def cmd_switch(args):
+    email = args[0] if args else None
+    if not email:
+        raise AccountError("usage: claude_account switch <email> [--dry-run]")
+    dry_run = "--dry-run" in args
+    record = load_record(email)
+
+    if email == current_email() and not dry_run:
+        print(f"{email} is already active")
+        return 0
+
+    usable, reason = credential_usable(record)
+    if not usable:
+        raise AccountError(
+            f"refusing to switch to {email}: {reason}. Log into that account "
+            "once and re-capture; swapping an expired credential in would "
+            "produce a session sitting at a login prompt.")
+
+    others = live_sessions(exclude_pid=os.getppid())
+    if others and "--force" not in args and not dry_run:
+        listing = ", ".join(f"{sid[:8]} (pid {pid})" for sid, pid in others[:4])
+        raise AccountError(
+            f"{len(others)} Claude Code session(s) are running: {listing}. "
+            "Switching the account breaks their in-flight work — a subagent "
+            "started after the switch authenticates as the new account and "
+            "dies on its limits. Wait for them to finish, or pass --force if "
+            "you accept that.")
+
+    if dry_run:
+        print(f"[dry-run] would switch {current_email()} -> {email}")
+        if others:
+            print(f"[dry-run]   WARNING: {len(others)} live session(s) "
+                  "would be affected")
+        print(f"[dry-run]   keychain item '{SERVICE}' for "
+              f"{keychain_account()}")
+        print(f"[dry-run]   ~/.claude.json oauthAccount -> "
+              f"{str(record.get('account_uuid'))[:8]}")
+        return 0
+
+    # Capture what is live before overwriting it, so a switch away from an
+    # account that was never captured cannot lose its credential.
+    previous = current_email()
+    if previous and previous != email:
+        try:
+            cmd_capture([])
+        except AccountError as exc:
+            print(f"warning: could not capture {previous} first: {exc}",
+                  file=sys.stderr)
+
+    keychain_write(json.dumps(record["credentials"]))
+    write_oauth_account(record["oauth_account"])
+    log_switch(previous, email)
+    applied = apply_tier_policy(record)
+    print(f"switched to {email} ({record.get('rate_limit_tier') or '?'})")
+    if applied:
+        chain = " -> ".join([applied["model"]] + list(
+            applied.get("fallbackModel") or []))
+        print(f"  model policy: {chain}")
+    if others:
+        print(f"  WARNING: {len(others)} other session(s) were running; their "
+              "next requests and any subagent they start now use this account")
+    return 0
+
+
+def cmd_check(args):
+    email = args[0] if args else current_email()
+    if not email:
+        raise AccountError("usage: claude_account check <email>")
+    record = load_record(email)
+    usable, reason = credential_usable(record)
+    blocked, earliest = limit_state(record)
+    print(f"{email}: credential {'ok' if usable else 'UNUSABLE'} — {reason}")
+    if blocked:
+        print(f"  blocked: {', '.join(sorted(blocked))} "
+              f"until {earliest:%Y-%m-%d %H:%M}Z")
+    return 0 if usable and not blocked else 1
+
+
+def cmd_note_limit(args):
+    if len(args) < 3:
+        raise AccountError(
+            "usage: claude_account note-limit <email> <kind> <resets_at_epoch>")
+    email, kind, resets = args[0], args[1], args[2]
+    record = load_record(email)
+    record.setdefault("limits", {})[kind] = {
+        "resets_at": int(float(resets)),
+        "noted_at": int(datetime.datetime.now().timestamp()),
+    }
+    save_record(record)
+    when = datetime.datetime.fromtimestamp(int(float(resets)),
+                                           datetime.timezone.utc)
+    print(f"{email}: {kind} spent until {when:%Y-%m-%d %H:%M}Z")
+    return 0
+
+
+def cmd_clear_limit(args):
+    if not args:
+        raise AccountError("usage: claude_account clear-limit <email> [kind]")
+    email = args[0]
+    record = load_record(email)
+    limits = record.setdefault("limits", {})
+    if len(args) > 1:
+        limits.pop(args[1], None)
+    else:
+        record["limits"] = {}
+    save_record(record)
+    print(f"{email}: limits cleared")
+    return 0
+
+
+def cmd_set_policy(args):
+    if len(args) < 2:
+        raise AccountError(
+            "usage: claude_account set-policy <email> <model> [fallback,...]")
+    email, model = args[0], args[1]
+    fallback = [t for t in args[2].split(",") if t] if len(args) > 2 else []
+    record = load_record(email)
+    record["tier_policy"] = {"model": model, "fallbackModel": fallback}
+    save_record(record)
+    chain = " -> ".join([model] + fallback)
+    print(f"{email}: model policy {chain}")
+    if email == current_email():
+        apply_tier_policy(record)
+        print("  applied to settings.json (this account is active)")
+    return 0
+
+
+def cmd_live_sessions(args):
+    """Print how many Claude Code sessions are running. For the supervisor."""
+    print(len(live_sessions(exclude_pid=os.getppid())))
+    return 0
+
+
+def cmd_setup(args):
+    """Walk a person through registering every account they want to rotate.
+
+    Capturing an account requires being logged into it, and only one can be
+    logged in at a time, so registration is inherently a loop of log in, save,
+    log in as the next. That loop is obvious once you know it and impossible to
+    guess, which is what this command exists to remove.
+
+    It cannot drive `/login` itself — that is an interactive browser flow inside
+    the Claude Code client — so it reports state and names the next action each
+    time it is run, rather than pretending to a completion it cannot deliver.
+    """
+    known = stored_emails()
+    active = current_email()
+
+    print("Multi-account setup")
+    print("===================")
+    print()
+    if not active:
+        print("No account is logged in. Run /login in Claude Code, then run")
+        print("this command again.")
+        return 1
+
+    if active not in known:
+        record = None
+        try:
+            cmd_capture([])
+            known = stored_emails()
+            record = load_record(active)
+        except AccountError as exc:
+            print(f"Could not save the active account: {exc}")
+            return 1
+        print()
+    else:
+        record = load_record(active)
+        print(f"Active account {active} is already saved.")
+        print()
+
+    print(f"Saved accounts ({len(known)}):")
+    for email in known:
+        rec = load_record(email)
+        usable, reason = credential_usable(rec)
+        policy = rec.get("tier_policy") or {}
+        chain = " -> ".join([policy["model"]] + list(
+            policy.get("fallbackModel") or [])) if policy.get("model") else "not set"
+        mark = "*" if email == active else " "
+        print(f"  {mark} {email}")
+        print(f"      plan: {rec.get('rate_limit_tier') or 'unknown'}")
+        print(f"      credential: {'ok' if usable else 'UNUSABLE'} — {reason}")
+        print(f"      model policy: {chain}")
+    print()
+
+    if len(known) < 2:
+        print("Next: add a second account, so there is somewhere to fail over to.")
+        print("  1. Run  /login  in Claude Code and sign in as the other account")
+        print("  2. Run  claude_account setup  again")
+        print()
+        print("Nothing rotates until at least two accounts are saved.")
+        return 0
+
+    print("You have enough accounts to rotate. Optional next steps:")
+    print()
+    unset = [e for e in known
+             if not (load_record(e).get("tier_policy") or {}).get("model")]
+    if unset:
+        print("  Model policy per account — a larger plan can default to a")
+        print("  cheaper model and keep the expensive one as headroom:")
+        for email in unset:
+            print(f"    claude_account set-policy {email} <model> [fallback,...]")
+        print()
+    print("  Preference order defaults to plan size (largest first). To override:")
+    print(f"    echo '{json.dumps(known)}' > "
+          f"{os.path.join(ROOT, 'account-preference.json')}")
+    print()
+    print("  Check the result any time with:  claude_account list")
+    return 0
+
+
+COMMANDS = {
+    "setup": cmd_setup,
+    "capture": cmd_capture,
+    "live-sessions": cmd_live_sessions,
+    "set-policy": cmd_set_policy,
+    "list": cmd_list,
+    "current": cmd_current,
+    "switch": cmd_switch,
+    "check": cmd_check,
+    "note-limit": cmd_note_limit,
+    "clear-limit": cmd_clear_limit,
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    handler = COMMANDS.get(argv[1])
+    if handler is None:
+        print(f"unknown subcommand: {argv[1]}", file=sys.stderr)
+        print(f"try one of: {', '.join(COMMANDS)}", file=sys.stderr)
+        return 2
+    try:
+        return handler(argv[2:])
+    except AccountError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

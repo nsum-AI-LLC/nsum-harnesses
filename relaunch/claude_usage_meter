@@ -76,10 +76,89 @@ def usage_tokens(usage: dict) -> float:
             + CACHE_READ_WEIGHT * usage.get("cache_read_input_tokens", 0))
 
 
-def window_burn(hours: float) -> tuple:
+SWITCH_LOG = os.path.join(ROOT, "account-switches.jsonl")
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+
+
+def current_account() -> str:
+    """The account logged in right now, or None when it cannot be read."""
+    try:
+        with open(CLAUDE_JSON) as f:
+            return (json.load(f).get("oauthAccount") or {}).get("emailAddress")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _switch_log() -> list:
+    entries = []
+    try:
+        with open(SWITCH_LOG) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry.get("epoch"), (int, float)):
+                    entries.append(entry)
+    except OSError:
+        return []
+    entries.sort(key=lambda e: e["epoch"])
+    return entries
+
+
+def active_intervals(email, start: float, end: float) -> list:
+    """The sub-spans of [start, end] during which `email` was the live account.
+
+    THIS IS WHY THE METER IS NOT A SIMPLE SUM. Two accounts share one machine
+    and the server meters each separately, so token burn inside the trailing
+    window belongs to whichever account was live when it was spent. Counting the
+    whole window bills the account you just switched TO for everything the
+    previous one spent — measured 2026-09-05, right after a switch: the meter
+    read 72.3% of the 5h pool while the server said 12%.
+
+    With no switch log the answer is the whole window, which is both the old
+    behaviour and the correct one on a single-account machine.
+    """
+    entries = _switch_log()
+    if not entries or not email:
+        return [(start, end)]
+
+    # Who was live at the window's start: the destination of the last switch at
+    # or before it, or — when every switch is later — the origin of the first.
+    before = [e for e in entries if e["epoch"] <= start]
+    if before:
+        active = before[-1].get("to")
+    else:
+        later = [e for e in entries if e["epoch"] > start]
+        active = later[0].get("from") if later else email
+
+    spans = []
+    cursor = start
+    for entry in entries:
+        if not (start < entry["epoch"] < end):
+            continue
+        if active == email:
+            spans.append((cursor, entry["epoch"]))
+        cursor = entry["epoch"]
+        active = entry.get("to")
+    if active == email:
+        spans.append((cursor, end))
+    return [(a, b) for a, b in spans if b > a]
+
+
+def window_burn(hours: float, spans=None) -> tuple:
     cutoff_epoch = time.time() - hours * 3600
+    if spans:
+        cutoff_epoch = min(a for a, _ in spans)
     cutoff_iso = datetime.datetime.fromtimestamp(
         cutoff_epoch, datetime.timezone.utc).isoformat()
+    bounds = None
+    if spans:
+        bounds = [(datetime.datetime.fromtimestamp(
+                       a, datetime.timezone.utc).isoformat(),
+                   datetime.datetime.fromtimestamp(
+                       b, datetime.timezone.utc).isoformat())
+                  for a, b in spans]
     total = 0.0
     files = 0
     for pattern in STORE_GLOBS:
@@ -97,8 +176,11 @@ def window_burn(hours: float) -> tuple:
                             rec = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if rec.get("timestamp", "") < cutoff_iso:
+                        stamp = rec.get("timestamp", "")
+                        if stamp < cutoff_iso:
                             continue
+                        if bounds and not any(a <= stamp < b for a, b in bounds):
+                            continue      # spent while another account was live
                         usage = (rec.get("message") or {}).get("usage")
                         if usage:
                             total += usage_tokens(usage)
@@ -107,8 +189,116 @@ def window_burn(hours: float) -> tuple:
     return total, files
 
 
-def ceiling() -> tuple:
-    """(ceiling_tokens or None, source string)."""
+ACCOUNTS_DIR = os.path.join(ROOT, "accounts")
+RATE_LIMITS = os.path.join(ROOT, "rate-limits.json")
+# How stale the server's own reading may be and still describe the burn we just
+# measured. Beyond this the two are describing different moments.
+CALIBRATION_FRESH_SECONDS = 600
+# Below this the server's rounded percentage is too coarse to divide by: at 1%
+# a half-point of rounding moves the implied ceiling by a third.
+CALIBRATION_MIN_PCT = 5.0
+
+
+def _account_file(account):
+    return os.path.join(ACCOUNTS_DIR, f"{account}.json") if account else None
+
+
+def server_reading(account, window_hours):
+    """(used_pct, captured_at) the server reported for THIS account, or None.
+
+    The statusline writes the harness's own `rate_limits` payload, which is the
+    authoritative number. It does not name an account, but it carries the time
+    it was taken: if no switch has happened since, it describes whoever is live
+    now.
+    """
+    if abs(window_hours - 5.0) > 0.01:
+        return None            # only the 5h pool is published this way
+    try:
+        with open(RATE_LIMITS) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    captured = data.get("captured_at")
+    if not isinstance(captured, (int, float)):
+        return None
+    switches = _switch_log()
+    if switches and switches[-1]["epoch"] > captured:
+        return None            # taken on a different account
+    if switches and switches[-1].get("to") != account:
+        return None
+    window = (data.get("rate_limits") or {}).get("five_hour") or {}
+    pct = window.get("used_percentage")
+    return (float(pct), float(captured)) if isinstance(pct, (int, float)) else None
+
+
+def calibrate_from_server(account, burn, window_hours):
+    """Store a per-account ceiling implied by the server's own percentage.
+
+    THE CEILING IS A PROPERTY OF THE ACCOUNT, NOT THE MACHINE. A Max 20x plan
+    and a Max 5x plan have different 5-hour pools, so one global ceiling
+    misreports by the plan ratio the moment the accounts differ — measured
+    2026-09-05: a ceiling calibrated on the 20x account read 4.4% where the 5x
+    account's server said 13%.
+
+    Waiting for a 429 to calibrate is not necessary when the server publishes a
+    percentage: burn / percentage is the ceiling, taken live and without
+    spending a limit to learn it.
+    """
+    reading = server_reading(account, window_hours)
+    if reading is None or not burn:
+        return None
+    pct, captured = reading
+    if pct < CALIBRATION_MIN_PCT:
+        return None
+    if time.time() - captured > CALIBRATION_FRESH_SECONDS:
+        return None
+    path = _account_file(account)
+    if not path or not os.path.exists(path):
+        return burn / (pct / 100.0)
+    try:
+        with open(path) as f:
+            record = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    # EACH SERVER READING CALIBRATES AT MOST ONCE. Burn keeps growing between
+    # readings while the percentage stays put, so recalibrating against a
+    # reading already used inflates the ceiling a little every run — a slow
+    # drift toward believing there is more headroom than there is, in the
+    # direction that gets a session killed rather than wound down.
+    if record.get("ceiling_reading_at") == int(captured):
+        return record.get("window_ceiling_tokens")
+    implied = burn / (pct / 100.0)
+    try:
+        record["window_ceiling_tokens"] = round(implied)
+        record["ceiling_reading_at"] = int(captured)
+        record["ceiling_calibrated_at"] = int(time.time())
+        record["ceiling_source"] = (
+            f"server reading {pct}% against {round(burn)} weighted tokens")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(record, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return implied
+
+
+def ceiling(account=None) -> tuple:
+    """(ceiling_tokens or None, source string).
+
+    The account's own calibrated ceiling wins over the machine-wide one, which
+    describes whichever plan happened to be live when it was measured.
+    """
+    path = _account_file(account)
+    if path:
+        try:
+            with open(path) as f:
+                value = json.load(f).get("window_ceiling_tokens")
+            if value:
+                return float(value), f"account({account})"
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
     try:
         with open(FIRSTPARTY) as f:
             value = json.load(f).get("window_ceiling_tokens")
@@ -132,13 +322,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--hours", type=float, default=5.0,
                         help="trailing window (default 5 — the unified 5h pool)")
+    parser.add_argument("--account", default=None,
+                        help="attribute burn to this account's live spans "
+                             "(default: the account logged in now)")
     parser.add_argument("--record-kill", action="store_true",
                         help="record the CURRENT window burn as a 429-kill "
                              "calibration observation (run when a limit hits)")
     args = parser.parse_args()
 
-    burn, files = window_burn(args.hours)
-    cap, source = ceiling()
+    account = args.account or current_account()
+    window_start = time.time() - args.hours * 3600
+    spans = active_intervals(account, window_start, time.time())
+    burn, files = window_burn(args.hours, spans=spans)
+    calibrate_from_server(account, burn, args.hours)
+    cap, source = ceiling(account)
+    # A window fully covered by one span is the ordinary case; anything less
+    # means a switch landed inside it and part of the burn belongs elsewhere.
+    scoped_hours = sum(b - a for a, b in spans) / 3600.0
 
     if args.record_kill:
         os.makedirs(ROOT, exist_ok=True)
@@ -160,12 +360,18 @@ def main() -> int:
         "ceiling_tokens": round(cap) if cap else None,
         "ceiling_source": source,
         "utilization_pct": round(100 * burn / cap, 1) if cap else None,
+        "account": account,
+        "account_hours_in_window": round(scoped_hours, 2),
     }
     print(json.dumps(result))
     pct = f"{result['utilization_pct']}%" if cap else "n/a (no ceiling)"
+    scope = ""
+    if scoped_hours < args.hours - 0.01:
+        scope = (f", {scoped_hours:.1f}h of it on {account}"
+                 if account else f", {scoped_hours:.1f}h scoped")
     print(f"[meter] {result['window_burn_tokens']:,} tokens / trailing "
           f"{args.hours:g}h across {files} transcripts — utilization {pct} "
-          f"({source})", file=sys.stderr)
+          f"({source}{scope})", file=sys.stderr)
     return 0
 
 

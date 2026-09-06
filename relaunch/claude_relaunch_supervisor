@@ -22,11 +22,33 @@ TWO RELAUNCH MODES, and the axis is WOUND-DOWN vs KILLED (not context vs usage):
     work sat unharvested until a human noticed. Resuming keeps the context that
     knows what was in flight, so the session can salvage its own work.
 
-MODEL: the supervisor names NO model. `~/.claude/settings.json` already encodes
-the policy (e.g. `model: fable`, `fallbackModel: [opus]`) and the client
-applies it per request; pinning `--model opus` here overrode that and kept a
-relaunched session off Fable even when Fable had capacity. Probing still names a
-model, because a canary must ask about a specific pool.
+A THIRD MODE, and the one a model-scoped limit actually wants:
+
+  * MODEL SWITCH IN PLACE (`/model <tier>` typed into the session's own live
+    window) — for a session stalled on a MODEL-SCOPED limit. Such a session is
+    not dead: a usage limit never kills the process, it only makes every request
+    fail, so the window, the shells and the subagents are all still there. The
+    correct move is the one the client's own error message names — "switch models
+    with /model" — not a relaunch. Nothing is killed, nothing forks, and in-flight
+    work is never orphaned because it is never interrupted.
+
+MODEL: the supervisor picks a tier ONLY from the order the owner declared in
+`~/.claude/settings.json` (`model`, then `fallbackModel`), and only after a probe
+says that tier is open. It invents no preference of its own — a hardcoded table
+here once pinned every relaunch to Opus and kept relaunched sessions off Fable
+even when Fable had capacity.
+
+But it can no longer decline to choose, because THE CLIENT DOES NOT APPLY THE
+FALLBACK CHAIN TO AN INTERACTIVE SESSION. `claude --help` is explicit on both
+counts: --fallback-model covers a primary that is "overloaded or not available",
+and "(only works with --print)". A usage limit is neither, and a terminal session
+is not --print. Measured 2026-09-05: three interactive sessions exhausted the
+Fable pool and took five hard stops between them with ZERO Opus turns, while
+settings carried `model: opus` and `fallbackModel: ["opus"]`; at 21:46:46 this
+supervisor resumed one of them onto the same exhausted tier and it re-died four
+seconds later, having killed the live original to get there. So the earlier
+version of this note — "the client's fallbackModel chain lands the relaunch on an
+open tier" — was simply false, and every model-scoped death inherited it.
 
 Trigger feeds, in authority order (BW-4994 ancestor-staleness rule):
 
@@ -129,6 +151,24 @@ PROBE_NEAR_WINDOW_SECONDS = 60 * 60
 # only delay. A session whose last subagent has reported goes quiet at once.
 SOURCE_QUIET_SECONDS = 5 * 60
 
+# How long a MODEL-SCOPED stall must have run before the supervisor touches it.
+# This class is detected while the session is still alive, so unlike a death the
+# owner may well be sitting in front of it, one keystroke from switching tier by
+# hand. Short, because the in-place switch costs the session nothing.
+MODEL_STALL_GRACE_SECONDS = 3 * 60
+
+# How long a model-scoped stall may keep running after its spec was consumed
+# before the supervisor is allowed to have another go. Sized to the OBSERVABLE,
+# not to caution: the switch is followed by a nudge, so a session that took it
+# runs a turn within about a minute and its newest turn stops being a rejection.
+# Anything past that is dormancy, which is the condition this supervisor exists to
+# end — so the window is short and MAX_RELAUNCHES_PER_HOUR does the escalating,
+# stopping and notifying after three tries rather than retrying forever.
+# Only the live-stall path ages its dedupe instant this way: a quiet death does
+# not repeat, and a spec waiting days for a weekly reset must never be re-minted
+# underneath itself.
+STALL_RETRY_AFTER_SECONDS = 10 * 60
+
 # The first message a RESUMED session receives. Kept free of double quotes,
 # backticks and '$' because it is interpolated into an AppleScript string that is
 # itself interpolated into a shell line.
@@ -137,6 +177,35 @@ SALVAGE_PROMPT = (
     "interrupted when the limit hit: check every agent that was in flight -- their "
     "worktrees may hold uncommitted changes and their branches unpushed commits -- "
     "harvest whatever completed, then carry on with the plan."
+)
+
+# The nudge typed into a session that was switched IN PLACE. It must not claim a
+# reset — nothing reset; the session moved tier — and it must say that nothing was
+# killed, because the salvage instruction above would otherwise send a session
+# hunting for orphaned work that was never orphaned.
+MODEL_SWITCH_PROMPT = (
+    "Your model tier hit its usage limit, so I switched this session to {tier} in "
+    "place -- nothing was killed, and your shells and subagents are intact. Take "
+    "stock of what landed while the turns were failing, then carry on with the plan."
+)
+# A phrase from that prompt distinctive enough to recognise it in the transcript,
+# which is how the switch confirms the nudge was SENT rather than merely typed.
+NUDGE_MARKER = "switched this session to"
+
+# How long to let the client settle between keystroke batches, and how many times
+# to re-send Enter before giving up on the nudge. Both exist because the TUI's
+# paste handling makes the submit racy; see switch_model_in_place.
+SWITCH_SETTLE_SECONDS = 3
+SUBMIT_ATTEMPTS = 3
+
+# The same situation, but reached by relaunch because the live window could not be
+# reached. Here the process really was replaced, so salvage IS the first job.
+MODEL_SWITCH_SALVAGE_PROMPT = (
+    "Your model tier hit its usage limit and this session was resumed on {tier} -- "
+    "the limit has NOT reset. Before anything else, salvage the work that was in "
+    "flight: check every agent that was running -- their worktrees may hold "
+    "uncommitted changes and their branches unpushed commits -- harvest whatever "
+    "completed, then carry on with the plan."
 )
 
 
@@ -273,31 +342,143 @@ def project_dir_for(transcript_path):
     return rc.resolve_project_slug(slug)
 
 
-def terminal_limit_record(tail):
-    """The line of the session's OWN killing limit rejection, or None.
+def tail_records(path, limit=200):
+    """The last records of a transcript, parsed, oldest first.
+
+    Bounded twice — by TAIL_BYTES off the end of the file and by record count —
+    because one record can be hundreds of KB and only recent history matters. The
+    first line after a mid-file seek is normally a fragment; it fails to parse and
+    is dropped, which is the intended behaviour rather than an error.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - TAIL_BYTES))
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    records = []
+    for line in raw.splitlines()[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def record_text(record):
+    """The text a transcript record renders as, or "" for one that renders none."""
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(block.get("text", "") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text")
+    return ""
+
+
+def record_epoch(record):
+    """A record's timestamp in epoch seconds, or None if it carries none."""
+    raw = record.get("timestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(
+            raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def own_turns(records):
+    """The session's OWN assistant turns, oldest first — sidechains excluded.
+
+    A subagent's turns land in the SAME transcript with ``isSidechain: true``, and
+    a stalled session with a live agent keeps producing them. Counting those as
+    the session's own turns would hide the stall behind its agents' progress.
+    """
+    return [r for r in records
+            if r.get("type") == "assistant" and r.get("isSidechain") is not True]
+
+
+def is_limit_rejection(record):
+    """Is this record the client's own limit rejection?
 
     A transcript can carry limit wording without having died of one — agent
     task-notifications and quoted text embed the exact provider message
-    mid-conversation (measured: the 2026-08-30 orchestrator transcript carries
-    its killed AGENTS' notifications while the session itself survived). So mere
-    marker presence in the tail is NOT a death; the death is a JSONL record the
-    client itself marked as an API error (``isApiErrorMessage: true`` — the same
-    field the statusline context calculation filters on), carrying limit wording,
-    in the transcript's FINAL records. Strict on purpose: a missed relaunch
-    degrades to the owner noticing; a false relaunch opens terminals against
-    sessions that never died.
+    mid-conversation (measured: the 2026-08-30 orchestrator transcript carries its
+    killed AGENTS' notifications while the session itself survived). So marker
+    presence is NOT a death; the death is a record the client itself marked as an
+    API error (``isApiErrorMessage: true`` — the same field the statusline context
+    calculation filters on) carrying limit wording.
     """
-    lines = [ln for ln in tail.splitlines() if ln.strip()]
-    for line in lines[-20:]:
-        if '"isApiErrorMessage":true' not in line.replace(" ", ""):
-            continue
-        if rc.is_limit_death(line):
-            return line
+    if record.get("isApiErrorMessage") is not True:
+        return False
+    return rc.is_limit_death(record_text(record))
+
+
+def terminal_limit_record(records):
+    """The text of the session's own killing limit rejection, or None.
+
+    "Terminal" means its LAST main-line assistant turn is a limit rejection — the
+    session has had no successful turn since. Anchoring on the last turn rather
+    than "a rejection somewhere in the tail" is what makes this safe to run
+    against a transcript that is still GROWING, which a model-scoped stall always
+    is: the session stays alive, its agents keep reporting, and every wake-up
+    earns a fresh rejection, while a recovered session carries a real model on its
+    newest turn. Strict on purpose: a missed relaunch degrades to the owner
+    noticing; a false one opens terminals against sessions that never died.
+    """
+    turns = own_turns(records)
+    if not turns or not is_limit_rejection(turns[-1]):
+        return None
+    return record_text(turns[-1])
+
+
+def stall_started_epoch(records):
+    """When the CURRENT unbroken run of limit rejections began, or None.
+
+    Every wake-up during a stall earns its own rejection, so the NEWEST death is a
+    moving target — deduping against it would synthesize a fresh spec every tick,
+    forever. The run's FIRST rejection is stable for as long as the stall lasts,
+    and a successful turn ends the run, so a genuinely new stall gets a genuinely
+    new instant.
+    """
+    started = None
+    for record in reversed(own_turns(records)):
+        if not is_limit_rejection(record):
+            break
+        epoch = record_epoch(record)
+        if epoch is not None:
+            started = epoch
+    return started
+
+
+def last_sidechain_epoch(records):
+    """When a subagent last appended to this transcript, or None if none has."""
+    for record in reversed(records):
+        if record.get("isSidechain") is True:
+            return record_epoch(record)
     return None
 
 
 def watchdog_synthesize(dry_run):
-    """Feed 2: turn an un-wound-down limit death into a spec (newest session only)."""
+    """Feed 2: turn an un-wound-down limit death into a spec (newest session only).
+
+    TWO SHAPES, and the difference is whether the session survived its limit:
+
+      * a SHARED-pool death goes quiet, because every model is refused and the
+        session has nothing left to do. Quiet-for-DEAD_AFTER_SECONDS is the
+        detector, as it always was.
+      * a MODEL-SCOPED stall stays LOUD. A usage limit never kills the process, so
+        the session sits there alive with its agents still reporting, and each
+        report earns another rejection. Waiting for it to go quiet means waiting
+        for every agent to drain — measured 2026-09-05, session 358a1131 was
+        detected only 11 minutes after its last agent finished, having stalled 20
+        minutes earlier. So this class is detected on the SHAPE of the transcript
+        (its last own turn is a rejection), not on silence.
+    """
     now = time.time()
     candidates = []
     for path in glob.glob(PROJECTS_GLOB):
@@ -305,40 +486,90 @@ def watchdog_synthesize(dry_run):
             mtime = os.path.getmtime(path)
         except OSError:
             continue
-        if now - mtime < DEAD_AFTER_SECONDS:          # still alive
-            continue
         if now - mtime > WATCHDOG_LOOKBACK_SECONDS:   # ancient
             continue
         session_id = os.path.splitext(os.path.basename(path))[0]
-        # mtime is this death's instant: a spec written before it belongs to an
-        # EARLIER death of the same (resumed) session and must not veto this one.
-        if already_handled(session_id, death_mtime=mtime):
-            continue
-        try:
-            with open(path, "rb") as f:
-                f.seek(max(0, os.path.getsize(path) - TAIL_BYTES))
-                tail = f.read().decode("utf-8", errors="replace")
-        except OSError:
-            continue
-        death_line = terminal_limit_record(tail)
+        records = tail_records(path)
+        death_line = terminal_limit_record(records)
         if death_line is None:
             continue
-        candidates.append((mtime, session_id, path, death_line))
+        kind, limit_name = rc.classify_limit(death_line)
+        quiet = now - mtime >= DEAD_AFTER_SECONDS
+        # `waits_for_reset` is the authority on which pools gate every tier; an
+        # unnameable limit is conservatively treated as shared by that same call.
+        model_scoped = not rc.waits_for_reset(kind)
+        stall_started = stall_started_epoch(records)
+        if not quiet and not model_scoped:
+            continue                                  # still alive and working
+        if model_scoped and not quiet:
+            if stall_started is None:
+                continue                              # cannot date it; wait for quiet
+            if now - stall_started < MODEL_STALL_GRACE_SECONDS:
+                continue                              # leave room for a human
+        # The instant this death is deduped against.
+        if model_scoped and stall_started:
+            # A live stall: the run's FIRST rejection, which holds still. The file
+            # mtime does not — the stall keeps appending — and using it would mint
+            # a new spec on every tick. Aged forward so that a stall STILL running
+            # long after its spec was consumed (a switch typed into a window that
+            # had moved on, a client that ignored the command) earns one retry per
+            # window rather than lying dormant; the crash-loop cap bounds the rest.
+            death_instant = max(stall_started, now - STALL_RETRY_AFTER_SECONDS)
+        else:
+            # A quiet death does not repeat, so its instant needs no ageing — and
+            # must not get any: a spec waiting days for a weekly reset would be
+            # re-minted every window, resetting the wait it is there to serve.
+            death_instant = mtime
+        # A spec written before this instant belongs to an EARLIER death of the
+        # same (resumed) session and must not veto this one.
+        if already_handled(session_id, death_mtime=death_instant):
+            continue
+        candidates.append({"mtime": mtime, "session_id": session_id, "path": path,
+                           "death_line": death_line, "kind": kind,
+                           "limit_name": limit_name, "quiet": quiet,
+                           "model_scoped": model_scoped,
+                           "stall_started": stall_started})
 
     if not candidates:
         return
-    candidates.sort(reverse=True)
-    if len({c[1] for c in candidates}) > 1:
-        # BW-4994 ambiguity rule: never guess between sessions.
-        names = ", ".join(c[1][:8] for c in candidates)
-        log("watchdog_ambiguous", candidates=[c[1] for c in candidates])
+    candidates.sort(key=lambda c: c["mtime"], reverse=True)
+
+    # THE AMBIGUITY RULE GUARDS THE DESTRUCTIVE PATH, and only it. Relaunching
+    # kills the original process to avoid forking it, so picking the wrong session
+    # of several costs real work and BW-4994 forbids the guess. Switching a
+    # session's tier in its OWN window destroys nothing and is decided per session
+    # from that session's own transcript, so several at once is not a guess — it
+    # is simply several sessions to switch, which is the ordinary shape of a
+    # model-scoped limit (measured 2026-09-05: two stalled at once, and the old
+    # rule would have refused both). A cohort member that cannot be switched in
+    # place is NOT quietly downgraded into the guess this rule forbids — see
+    # launch(), which refuses that degrade.
+    switchable = [c for c in candidates if c["model_scoped"]]
+    quiet_deaths = [c for c in candidates if not c["model_scoped"]]
+    for candidate in switchable:
+        write_watchdog_spec(candidate, cohort=len(switchable) > 1,
+                            dry_run=dry_run)
+
+    if not quiet_deaths:
+        return
+    if len({c["session_id"] for c in quiet_deaths}) > 1:
+        names = ", ".join(c["session_id"][:8] for c in quiet_deaths)
+        log("watchdog_ambiguous",
+            candidates=[c["session_id"] for c in quiet_deaths])
         notify("Claude relaunch supervisor",
                f"Multiple limit-dead sessions ({names}) — not relaunching. "
                f"Write a spec for the right one.")
         return
+    write_watchdog_spec(quiet_deaths[0], cohort=False, dry_run=dry_run)
 
-    mtime, session_id, path, death_line = candidates[0]
-    kind, limit_name = rc.classify_limit(death_line)
+
+def write_watchdog_spec(best, cohort, dry_run):
+    """Turn one watchdog candidate into a pending spec."""
+    mtime = best["mtime"]
+    session_id = best["session_id"]
+    path = best["path"]
+    death_line = best["death_line"]
+    kind, limit_name = best["kind"], best["limit_name"]
 
     # Structured epoch seconds from the statusline capture beat parsing prose;
     # prose is the fallback, and neither being available is survivable now.
@@ -358,17 +589,22 @@ def watchdog_synthesize(dry_run):
         else:
             # Unknown reset is NOT a reason to do nothing. Poll until it opens.
             wait_until = "probe"
+        # A watchdog death wrote no handoff, so there is nothing to /pickup:
+        # resume the session itself and have it salvage its own in-flight work.
+        mode = "resume"
     else:
-        # Model-scoped: another tier is open right now. Waiting would be the bug —
-        # the client's fallbackModel chain lands the relaunch on an open tier.
+        # Model-scoped: another tier is open right now, so there is nothing to
+        # wait for — and nothing to relaunch either. The session is still ALIVE,
+        # only refusing turns, so the move is the one its own error message names:
+        # switch tier in its own window. `launch` degrades this to a relaunch that
+        # names the tier only when that window cannot be reached.
         wait_until = "now"
+        mode = "model_switch"
 
     spec = {
         "session_id": session_id,
         "reason": "usage-crash-watchdog",
-        # A watchdog death wrote no handoff, so there is nothing to /pickup:
-        # resume the session itself and have it salvage its own in-flight work.
-        "mode": "resume",
+        "mode": mode,
         "wait_until": wait_until,
         "limit_kind": kind,
         "limit_name": limit_name,
@@ -376,7 +612,16 @@ def watchdog_synthesize(dry_run):
         "project_dir": project_dir_for(path),
         "created_by": "watchdog",
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        # Which detector fired: a quiet transcript, or the shape of a still-live
+        # one. Worth keeping — they answer different questions after the fact.
+        "detected_live": not best["quiet"],
+        # True when this session was one of several stalled at the same instant.
+        # Safe to switch in place; never safe to degrade into a relaunch.
+        "cohort": cohort,
     }
+    if best["stall_started"] is not None:
+        spec["stall_started_at"] = datetime.datetime.fromtimestamp(
+            best["stall_started"], datetime.timezone.utc).isoformat()
     log("watchdog_spec_synthesized", **spec)
     if dry_run:
         print(f"[dry-run] would synthesize spec: {json.dumps(spec)}")
@@ -417,7 +662,7 @@ def relaunch_mode(spec):
     `mode` in the spec always wins, so a spec can ask for either.
     """
     explicit = spec.get("mode")
-    if explicit in ("resume", "pickup"):
+    if explicit in ("resume", "pickup", "model_switch"):
         return explicit
     return "resume" if spec.get("created_by") == "watchdog" else "pickup"
 
@@ -442,11 +687,14 @@ def resume_blocked_reason(spec):
 
 
 def source_still_working(spec):
-    """Is the session this spec targets STILL PROCESSING TURNS? Reason, or None.
+    """Is the session this spec targets STILL PROCESSING WORK? Reason, or None.
 
-    Applies to BOTH modes, because launching early is wrong in both — differently:
+    Applies to ALL THREE modes, because acting early is wrong in each — for
+    different reasons:
 
-      * resume — a live process means `--resume` would fork a COPY.
+      * resume — a live process means `--resume` would fork a COPY, and the
+        retirement hook resolves that by KILLING the original, so anything still
+        running under it dies with it.
       * pickup — a live source means two sessions working the same plan. Measured
         2026-09-04: a session at 83% context wrote a `reason=context` spec while a
         developer agent was still running. That spec carries `wait_until: "now"`,
@@ -454,24 +702,54 @@ def source_still_working(spec):
         while the predecessor was still appending (23:33:59 launch, 23:34:16
         append). The handoff flow says "wait until your subagents finish", but that
         is prose addressed to the model, not a gate — so nothing enforced it.
+      * model_switch — text typed at a session mid-turn is queued, not run, so a
+        `/model` sent into a busy window may simply sit in its prompt buffer.
 
-    TRANSCRIPT GROWTH is the signal, not process liveness: a wound-down session's
-    process stays alive sitting at its prompt, exactly like a usage-killed one, so
-    pid-alive cannot distinguish "working" from "finished". A session with a live
-    subagent keeps appending (task notifications land in the parent transcript),
-    so growth tracks the thing we actually care about.
+    TWO SIGNALS, because neither covers the other:
+
+      * TRANSCRIPT GROWTH, not process liveness. A wound-down session's process
+        sits alive at its prompt exactly like a usage-killed one, so pid-alive
+        cannot tell "working" from "finished"; a session with a live subagent
+        keeps appending, so growth does.
+      * LIVE TOOL SHELLS, because growth misses them entirely. A backgrounded Bash
+        command keeps its shell alive while appending NOTHING, so a session can
+        look quiet for an hour with a build still running under it. This is the
+        owner's requirement of 2026-09-05: let background work finish first.
     """
     session = spec["session_id"]
-    if transcript_path_for(session) is None:
+    entry = rc.live_session_process(session)
+    if entry:
+        shells = rc.running_tool_shells(entry["pid"])
+        if shells:
+            return (f"{len(shells)} background shell(s) under pid "
+                    f"{entry['pid']}: {shells[0][:90]}")
+    path = transcript_path_for(session)
+    if path is None:
         return None  # nothing to race with; the mode-specific gate handles it
     mtime = transcript_mtime(session)
     if mtime is None:
         return None
     idle = time.time() - mtime
-    if idle < SOURCE_QUIET_SECONDS:
-        return (f"source session still appending "
-                f"({idle:.0f}s ago; needs {SOURCE_QUIET_SECONDS}s quiet)")
-    return None
+    if idle >= SOURCE_QUIET_SECONDS:
+        return None
+
+    if relaunch_mode(spec) == "model_switch":
+        # A stalled session appends CONSTANTLY without doing any work: each
+        # wake-up earns a fresh rejection. Reading that as "still working" would
+        # hold the switch for as long as the stall lasts, which is exactly
+        # backwards. Only a SIDECHAIN append — a subagent still reporting — is
+        # work here, and the shell check above covers the rest.
+        agent_epoch = last_sidechain_epoch(tail_records(path))
+        if agent_epoch is None:
+            return None
+        agent_idle = time.time() - agent_epoch
+        if agent_idle >= SOURCE_QUIET_SECONDS:
+            return None
+        return (f"subagent still reporting ({agent_idle:.0f}s ago; "
+                f"needs {SOURCE_QUIET_SECONDS}s quiet)")
+
+    return (f"source session still appending "
+            f"({idle:.0f}s ago; needs {SOURCE_QUIET_SECONDS}s quiet)")
 
 
 def retire(spec_path):
@@ -516,35 +794,366 @@ def resume_helper_for(project):
     return None
 
 
-def build_command(spec, project):
+def build_command(spec, project, tier=None):
     """The shell command a relaunch runs, and the mode it represents.
 
-    No --model: ~/.claude/settings.json already carries the tier policy
-    (e.g. fable, falling back to opus) and the client applies it per request.
-    Naming a model here overrode that policy and pinned a relaunch to one tier.
+    --model is named ONLY when `tier` is passed, which happens only on the
+    degraded model_switch path — a session stalled on an exhausted tier whose live
+    window could not be reached. Resuming it without naming a tier restores the
+    session's own model selection, i.e. the exhausted one, and it re-dies within
+    seconds (measured 2026-09-05: relaunch at 21:46:46, rejections at 21:46:49 and
+    21:46:50). For every other relaunch the tier stays the client's decision, from
+    settings' model/fallbackModel — naming one here once pinned every relaunch to
+    Opus.
     """
     session = spec["session_id"]
     explicit = spec.get("cmd")
     if explicit:
         return explicit, spec.get("mode") or "custom"
     mode = relaunch_mode(spec)
-    if mode == "resume":
+    if mode in ("resume", "model_switch"):
+        if tier:
+            prompt = MODEL_SWITCH_SALVAGE_PROMPT.format(tier=tier)
+            model_arg = f" --model {tier}"
+        else:
+            prompt = SALVAGE_PROMPT
+            model_arg = ""
         helper = resume_helper_for(project)
         if helper:
-            return f'{helper} {session} \\"{SALVAGE_PROMPT}\\"', "resume"
+            # The helper takes leading flags before the id: `--model M <id> [prompt]`.
+            return f'{helper}{model_arg} {session} \\"{prompt}\\"', "resume"
         # No helper on this machine: resume directly. Loses the archive/live
         # reconciliation, keeps the thing that matters — the same session.
-        return (f'claude --resume {session} \\"{SALVAGE_PROMPT}\\"', "resume")
+        return (f'claude --resume {session}{model_arg} \\"{prompt}\\"', "resume")
     return f'claude \\"/pickup {session}\\"', "pickup"
 
 
+def iterm_write(guid, text):
+    """Type one line into the iTerm session with this id.
+
+    Sessions are addressed by GUID rather than by pane coordinates — panes move
+    when tabs are rearranged, ids do not — and the window is deliberately NOT
+    activated: the owner may be typing somewhere else, and iTerm delivers to a
+    background session perfectly well.
+    """
+    osa = (
+        'tell application "iTerm"\n'
+        '  repeat with w in windows\n'
+        '    repeat with t in tabs of w\n'
+        '      repeat with s in sessions of t\n'
+        f'        if id of s is "{guid}" then\n'
+        f'          tell s to write text "{text}"\n'
+        '        end if\n'
+        '      end repeat\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        'end tell'
+    )
+    subprocess.run(["osascript", "-e", osa], check=True, timeout=30)
+
+
+def nudge_landed(session_id, since_epoch):
+    """Did the nudge reach the session as a real submitted message?
+
+    Asked of the TRANSCRIPT, not the screen: once submitted the text appears in
+    the scrollback too, so the screen cannot tell "typed" from "sent" — which is
+    the only distinction that matters here.
+    """
+    path = transcript_path_for(session_id)
+    if path is None:
+        return False
+    for record in reversed(tail_records(path, limit=40)):
+        epoch = record_epoch(record)
+        if epoch is not None and epoch < since_epoch:
+            break
+        if record.get("type") == "user" and NUDGE_MARKER in record_text(record):
+            return True
+    return False
+
+
+def switch_model_in_place(session_id, guid, tier):
+    """Switch a live session's tier in its own window. True if the nudge landed.
+
+    THE NUDGE CANNOT BE SENT BY BLIND TIMING, which is how this was first written
+    and why it is now a handshake. `write text` appends a newline, and for a short
+    line that submits — measured 2026-09-05, "/model opus" ran and the client
+    answered "Set model to Opus 5". The 230-character nudge did not: it arrives as
+    one burst, the TUI takes it as a PASTE, and a paste's newline is inserted as
+    text rather than submitting, leaving the prompt looking finished while the
+    session stays stalled. Adding a fixed 1s delay then an Enter was WORSE — the
+    Enter landed mid-paste and the whole nudge was discarded, reaching neither the
+    buffer nor the transcript. Both failures are timing races, so the fix is to
+    stop guessing: send Enter, ask the transcript whether a message actually
+    arrived, and only stop when it has.
+
+    A switch whose nudge never lands is not a disaster: the tier still changed,
+    and the session's newest own turn is still a rejection, so the watchdog sees
+    it as stalled and comes back inside STALL_RETRY_AFTER_SECONDS.
+    """
+    started = time.time()
+    iterm_write(guid, f"/model {tier}")
+    time.sleep(SWITCH_SETTLE_SECONDS)     # let the client apply it first, so the
+    iterm_write(guid, MODEL_SWITCH_PROMPT.format(tier=tier))   # nudge is not
+    for _ in range(SUBMIT_ATTEMPTS):                           # typed into the
+        time.sleep(SWITCH_SETTLE_SECONDS)                      # confirmation
+        if nudge_landed(session_id, started):
+            return True
+        iterm_write(guid, "")             # the Enter the paste swallowed
+    return nudge_landed(session_id, started)
+
+
+# How long to let a relaunched client boot before typing a slash command into
+# it. The client has to be at its prompt or the text lands in the terminal's
+# scrollback instead, so this is deliberately generous — an extra few seconds
+# costs nothing on a path that only runs after a usage limit.
+BOOT_SETTLE_SECONDS = 12
+
+
+def launch_window(spec, tier=None):
+    """Open a window running this spec's relaunch command. Returns its iTerm id.
+
+    Returns None when the window could not be opened, or when it opened under
+    Terminal.app, which has no session id to address later. A None result is not
+    read as "nothing happened": the caller must assume the command may be running
+    and say so rather than reporting a clean failure.
+    """
+    project = spec.get("project_dir") or os.getcwd()
+    cmd, _ = build_command(spec, project, tier=tier)
+    shell_line = f"cd {project} && {cmd}"
+
+    if not os.path.isdir("/Applications/iTerm.app"):
+        osa = (f'tell application "Terminal" to do script "{shell_line}"\n'
+               f'tell application "Terminal" to activate')
+        try:
+            subprocess.run(["osascript", "-e", osa], check=True, timeout=30)
+        except (subprocess.SubprocessError, OSError) as exc:
+            log("launch_window_failed", session_id=spec.get("session_id"),
+                terminal="Terminal.app", error=str(exc))
+            return None
+        # Terminal.app opened it, but exposes no addressable session id, so a
+        # follow-up slash command cannot be typed into it.
+        return None
+
+    # `id of current session` is read INSIDE the same tell block that creates the
+    # window, so the id belongs to the window just opened even if the owner
+    # focuses another one a moment later.
+    osa = (
+        'tell application "iTerm"\n'
+        '  activate\n'
+        '  create window with default profile\n'
+        '  tell current session of current window\n'
+        f'    write text "{shell_line}"\n'
+        '    return id\n'
+        '  end tell\n'
+        'end tell'
+    )
+    try:
+        proc = subprocess.run(["osascript", "-e", osa], check=True,
+                              capture_output=True, text=True, timeout=30)
+    except (subprocess.SubprocessError, OSError) as exc:
+        log("launch_window_failed", session_id=spec.get("session_id"),
+            terminal="iTerm", error=str(exc))
+        return None
+    guid = proc.stdout.strip()
+    return guid or None
+
+
+def arm_remote_control(guid):
+    """Type /remote-control into a freshly launched session. True if sent.
+
+    An account switch disconnects Remote Control — it is bound to the account
+    that armed it — so a session relaunched on the other login starts unreachable
+    from the owner's phone unless it is re-armed. This types the command the way
+    the model switch does, which is proven to submit: a short line's trailing
+    newline is taken as Enter rather than as a paste.
+
+    Whether the command was ACCEPTED is not asserted. The new session's id is not
+    known here (it is minted by the client after boot), so there is no transcript
+    to confirm against, and claiming success from a successful keystroke would be
+    exactly the unverified assertion this codebase forbids. The caller reports it
+    as attempted, and a failure is visible to the owner as a session missing from
+    their phone.
+    """
+    if not guid:
+        return False
+    time.sleep(BOOT_SETTLE_SECONDS)
+    try:
+        iterm_write(guid, "/remote-control")
+    except (subprocess.SubprocessError, OSError) as exc:
+        log("remote_control_arm_failed", guid=guid, error=str(exc))
+        return False
+    return True
+
+
+def switch_account_and_relaunch(spec, dry_run):
+    """Move the machine to another account and relaunch there. True if handled.
+
+    EVERY pool is per-account, so this answers a model-scoped limit as well as a
+    shared one. It is only reached after `choose_open_tier` has found no open
+    tier on the current account, which is what makes the distinction moot: a
+    shared pool never had a tier to move to, and a model pool has already had
+    that option and exhausted it. Preferring /model where it works is handled
+    upstream by trying it first, not by refusing to switch accounts here.
+
+    The exhausted account's limit is recorded before the switch, so the next
+    escalation does not walk back into it, and so the return trip can wait for a
+    known reset instead of polling blind.
+    """
+    kind = spec.get("limit_kind")
+    session = spec["session_id"]
+    leaving = rc.current_account()
+    if leaving is None:
+        log("account_switch_unavailable", session_id=session,
+            reason="cannot read the account that is logged in")
+        return False
+
+    resets_at = spec.get("resets_at") or spec.get("reset_epoch")
+    if resets_at:
+        rc.note_account_limit(leaving, kind, resets_at)
+
+    target, detail = rc.choose_open_account(kind, exclude=(leaving,))
+    if target is None:
+        log("no_open_account", session_id=session, limit_kind=kind,
+            leaving=leaving, detail=detail)
+        notify("Claude relaunch supervisor",
+               f"{spec.get('limit_name') or 'That pool'} is spent on every "
+               f"stored account — {session[:8]} waits for the earliest reset.")
+        return False
+
+    # A shared pool has already stopped every session on this account, so the
+    # switch takes nothing from them. A model pool has not, and sessions running
+    # a different tier are still working — those are not disrupted for the sake
+    # of one stalled session; it waits for the reset instead. Decided BEFORE the
+    # dry-run returns, so a dry run reports the decision that would really be
+    # taken rather than the one it would like to take.
+    others = rc.live_sessions_count()
+    if others and rc.account_switch_disrupts_others(kind):
+        log("account_switch_deferred", session_id=session, limit_kind=kind,
+            live_sessions=others, target=target, dry_run=dry_run)
+        if dry_run:
+            print(f"[dry-run] would DEFER: {kind} is model-scoped and {others} "
+                  f"session(s) are working on {leaving}")
+            return False
+        notify("Claude relaunch supervisor",
+               f"{session[:8]} is stalled on "
+               f"{spec.get('limit_name') or kind}, but {others} other "
+               f"session(s) are working on {leaving} — not switching the "
+               "account out from under them.")
+        return False
+
+    if dry_run:
+        print(f"[dry-run] would switch account {leaving} -> {target} "
+              f"({kind} spent) and relaunch {session[:8]} with /remote-control"
+              + (f"; {others} live session(s) share this account and are "
+                 "already stopped by it" if others else ""))
+        return True
+
+    ok, switch_detail = rc.switch_account(target, force=bool(others))
+    if not ok:
+        log("account_switch_failed", session_id=session, target=target,
+            detail=switch_detail)
+        notify("Claude relaunch supervisor",
+               f"Could not switch to {target} for {session[:8]}: "
+               f"{switch_detail}")
+        return False
+    log("account_switched", session_id=session, limit_kind=kind,
+        leaving=leaving, target=target, detail=switch_detail)
+
+    guid = launch_window(spec, tier=None)
+    if guid is None:
+        # The account DID move, so say so rather than reporting a clean failure:
+        # the next launch will use the new account whether or not this window
+        # opened, and the owner needs to know which login they are on.
+        notify("Claude relaunch supervisor",
+               f"Switched to {target} ({kind} spent on {leaving}) but could "
+               f"not open a window for {session[:8]} — start it by hand.")
+        return True
+
+    armed = arm_remote_control(guid)
+    record_relaunch(spec, "account_switch")
+    log("relaunched", session_id=session, reason=spec.get("reason"),
+        mode="account_switch", account=target, guid=guid,
+        remote_control=armed)
+    tail = ("Remote Control re-armed." if armed
+            else "Remote Control may need /remote-control by hand.")
+    notify("Claude relaunch supervisor",
+           f"Switched to {target} and relaunched {session[:8]} "
+           f"({spec.get('limit_name') or kind} spent on {leaving}). {tail}")
+    return True
+
+
 def launch(spec, dry_run):
+    """Act on one due spec. True when the spec was consumed, False when held.
+
+    False means the supervisor deliberately did nothing and the spec must stay
+    pending. Today that is only "no declared tier is open", where the honest move
+    is to keep waiting rather than move a session onto another shut pool.
+    """
     # Every spec carries project_dir (the writer records CLAUDE_PROJECT_DIR; the
     # watchdog resolves it from the transcript's slug), so the fallback is only
     # for a hand-written spec that omitted it.
     project = spec.get("project_dir") or os.getcwd()
     session = spec["session_id"]
-    cmd, mode = build_command(spec, project)
+    tier = None
+
+    if relaunch_mode(spec) == "model_switch":
+        tier, detail, unknown = rc.choose_open_tier(spec.get("limit_kind"))
+        if tier is None:
+            log("no_open_tier", session_id=session,
+                limit_kind=spec.get("limit_kind"), detail=detail,
+                indeterminate=unknown)
+            if unknown:
+                # A probe could not answer. That is not evidence a pool is shut,
+                # so nothing is switched and nothing is said; the next tick asks
+                # again.
+                return False
+            # Every declared tier really is spent. On a MODEL-SCOPED pool that is
+            # the end of the road, but a SHARED pool (5-hour, weekly) gates every
+            # model on this account and says nothing about another account, so the
+            # switch moves accounts instead of tiers.
+            if switch_account_and_relaunch(spec, dry_run):
+                return True
+            notify("Claude relaunch supervisor",
+                   f"{spec.get('limit_name') or 'That tier'} is spent for "
+                   f"{session[:8]} and every declared fallback is too — "
+                   f"widen settings' fallbackModel, or switch by hand.")
+            return False
+        entry = rc.live_session_process(session)
+        guid = rc.iterm_guid(entry)
+        open_terminals = rc.iterm_session_ids()
+        # An indeterminate terminal listing is not evidence the window is gone, so
+        # it degrades to a relaunch rather than being read either way.
+        if guid and open_terminals is not None and guid in open_terminals:
+            if dry_run:
+                print(f"[dry-run] would type '/model {tier}' into iTerm session "
+                      f"{guid[:8]} for {session[:8]} (pid {entry['pid']})")
+                return True
+            nudged = switch_model_in_place(session, guid, tier)
+            record_relaunch(spec, "model_switch")
+            log("model_switched", session_id=session, tier=tier,
+                limit_kind=spec.get("limit_kind"), pid=entry["pid"], guid=guid,
+                nudged=nudged)
+            tail = ("nothing killed." if nudged
+                    else "nothing killed, but it did not pick the nudge up.")
+            notify("Claude relaunch supervisor",
+                   f"Switched {session[:8]} to {tier} in place — "
+                   f"{spec.get('limit_name') or 'limit'} spent, {tail}")
+            return True
+        log("model_switch_unreachable", session_id=session, tier=tier,
+            pid=(entry or {}).get("pid"), guid=guid,
+            terminals_listed=(open_terminals is not None))
+        if spec.get("cohort"):
+            # Several sessions stalled together. Switching each in place is safe;
+            # relaunching one of them is exactly the guess the ambiguity rule
+            # forbids, so this one waits for its window instead of being killed.
+            log("cohort_degrade_refused", session_id=session, tier=tier)
+            notify("Claude relaunch supervisor",
+                   f"{session[:8]} is stalled on "
+                   f"{spec.get('limit_name') or 'a limit'} but its window is "
+                   f"gone, and others stalled with it — switch it by hand.")
+            return False
+
+    cmd, mode = build_command(spec, project, tier=tier)
     shell_line = f"cd {project} && {cmd}"
     # Prefer iTerm2 when installed (the owner's terminal — its AppleScript API
     # opens a real window + writes the command); Terminal.app is the fallback so
@@ -564,14 +1173,15 @@ def launch(spec, dry_run):
                f'tell application "Terminal" to activate')
     if dry_run:
         print(f"[dry-run] would launch: {shell_line}")
-        return
+        return True
     subprocess.run(["osascript", "-e", osa], check=True, timeout=30)
     record_relaunch(spec, mode)
     log("relaunched", session_id=session, reason=spec.get("reason"),
-        mode=mode, shell=shell_line)
+        mode=mode, tier=tier, shell=shell_line)
     verb = "Resumed" if mode == "resume" else "Relaunched"
     notify("Claude relaunch supervisor",
            f"{verb} session {session[:8]} ({spec.get('reason')}).")
+    return True
 
 
 def should_launch_now(spec, dry_run):
@@ -646,6 +1256,15 @@ def tick(dry_run):
                f"Investigate; touch 'pause' to silence.")
         return 1
 
+    # Keep the logged-in account's stored credential current. A session
+    # refreshes its own tokens as it runs and the refresh token ROTATES when it
+    # does, so a copy captured days ago is dead on arrival — and the failure only
+    # shows up later, as a relaunched session sitting at a login prompt instead
+    # of working. One Keychain read and one small file write per tick buys the
+    # guarantee that whatever we switch away from can be switched back to.
+    if not dry_run:
+        rc.refresh_account_capture()
+
     # Feed 2 first, so a fresh death becomes a spec this same tick.
     watchdog_synthesize(dry_run)
 
@@ -700,14 +1319,16 @@ def tick(dry_run):
                     retire(path)
                 continue
         try:
-            launch(spec, dry_run)
+            consumed = launch(spec, dry_run)
         except Exception as exc:  # a failed launch must be visible, not fatal
             log("launch_failed", session_id=spec.get("session_id"),
                 error=str(exc))
             notify("Claude relaunch supervisor",
                    f"Launch FAILED for {spec.get('session_id', '?')[:8]}: {exc}")
             continue
-        if not dry_run:
+        # A spec the supervisor deliberately declined to act on stays pending, so
+        # the next tick can try again once a tier opens.
+        if consumed and not dry_run:
             retire(path)
     return 0
 

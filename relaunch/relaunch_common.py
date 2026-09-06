@@ -63,6 +63,7 @@ is therefore the one case the product deliberately does not cover.
 """
 
 import datetime
+import time
 import getpass
 import json
 import os
@@ -159,9 +160,16 @@ LIMIT_NAME_TO_KIND = {
     "monthly spend": "credits",
 }
 
-# Kinds that gate EVERY model. Only these are worth waiting on; a model-scoped
-# limit is escaped by switching tier, not by waiting.
-SHARED_POOL_KINDS = frozenset({"session", "weekly"})
+# Kinds that gate EVERY model on the account. Only these are worth waiting on; a
+# model-scoped limit is escaped by switching tier, not by waiting.
+#
+# `credits` — the monthly spend cap — belongs here and was missing until a
+# session hit it: "You've hit your monthly spend limit" stops Opus, Sonnet and
+# every other tier alike, because it is a cap on overage spend rather than on a
+# model's pool. Classified but treated as model-scoped, it made an exhausted
+# account look like a usable destination and made a switch look disruptive to
+# sessions that were in fact already stopped.
+SHARED_POOL_KINDS = frozenset({"session", "weekly", "credits"})
 
 # NOTE: there is deliberately no tier-preference table here any more. Choosing
 # which model a relaunch runs on is the CLIENT's job, from settings.json's
@@ -453,3 +461,479 @@ def probe_available(model):
     if is_limit_death(detail):
         return False, detail
     return None, f"non-limit error: {detail}"
+
+
+# ------------------------------------------------ the account's declared tiers
+
+SETTINGS_PATH = os.path.join(HOME, ".claude", "settings.json")
+
+# The short names both `--model` and `/model` accept. The lookup below is a
+# substring test so a fully-qualified id ("claude-opus-5") and an alias
+# ("opusplan") resolve to the tier they name; no tier name contains another.
+KNOWN_TIERS = ("fable", "opus", "sonnet", "haiku")
+
+
+def tier_name(value):
+    """The short tier a settings value names, or None if it names none."""
+    if not isinstance(value, str):
+        return None
+    lowered = value.strip().lower()
+    for tier in KNOWN_TIERS:
+        if tier in lowered:
+            return tier
+    return None
+
+
+def tier_preference(settings_path=None):
+    """The account's declared tier order: `model` first, then `fallbackModel`.
+
+    THE CLIENT DOES NOT APPLY THAT CHAIN TO AN INTERACTIVE SESSION, which is the
+    only reason this function has to exist. `claude --help` is explicit on both
+    counts: --fallback-model covers a primary that is "overloaded or not
+    available", and "(only works with --print)". A usage limit is neither of
+    those, and an interactive session is not --print.
+
+    Measured 2026-09-05: three interactive sessions exhausted the Fable pool and
+    took five hard stops between them ("You've reached your Fable limit ... switch
+    models with /model") with ZERO Opus turns, while settings carried
+    `model: opus` and `fallbackModel: ["opus"]`. So a model-scoped limit does not
+    resolve itself, and something has to choose the tier.
+
+    The supervisor reads the order the owner declared and applies it; it does not
+    invent one. That distinction is the 2026-09-04 lesson — a hardcoded preference
+    table here pinned every relaunch to Opus and kept relaunched sessions off
+    Fable even when Fable had capacity.
+    """
+    path = settings_path or SETTINGS_PATH
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(settings, dict):
+        return []
+    declared = [settings.get("model")]
+    fallback = settings.get("fallbackModel")
+    # Both shapes occur: the CLI flag documents a comma-separated list, and the
+    # settings key is written as a JSON array (this account's is ["opus"]).
+    if isinstance(fallback, str):
+        declared.extend(fallback.split(","))
+    elif isinstance(fallback, list):
+        declared.extend(fallback)
+    order = []
+    for value in declared:
+        tier = tier_name(value)
+        if tier and tier not in order:
+            order.append(tier)
+    return order
+
+
+def choose_open_tier(exhausted_kind, preference=None, probe=None):
+    """(tier, detail, unknown) — the first declared tier OTHER than the exhausted
+    one that a probe finds open, or (None, reason, unknown) when none does.
+
+    Probing is what makes the switch safe to act on: moving a session onto a tier
+    that is itself exhausted just relocates the stall, and quota state is only
+    knowable by making a request (see WHY A PROBE EXISTS AT ALL, above). An
+    indeterminate probe is never read as open.
+
+    `unknown` is True when at least one candidate could not be determined, and it
+    exists so the caller does not tell the owner the wrong thing. "Every tier you
+    declared is spent" and "a probe could not answer" both leave the switch
+    un-made, but only the first is worth acting on — advising someone to widen
+    `fallbackModel` because the network blinked is a false alarm, and false alarms
+    are how a real one gets ignored. Measured 2026-09-05: three probes inside 40s,
+    and the third came back indeterminate while the pool was demonstrably open.
+    """
+    order = preference if preference is not None else tier_preference()
+    probe = probe or probe_available
+    candidates = [tier for tier in order if tier != exhausted_kind]
+    if not candidates:
+        return None, ("no alternative tier declared in settings "
+                      f"(order: {order or 'empty'})"), False
+    seen = []
+    unknown = False
+    for tier in candidates:
+        available, detail = probe(tier)
+        seen.append(f"{tier}={available}")
+        if available is True:
+            return tier, detail, False
+        if available is None:
+            unknown = True
+    reason = ("could not determine any declared tier" if unknown
+              else "every declared tier answered closed")
+    return None, f"{reason} (" + ", ".join(seen) + ")", unknown
+
+
+# --------------------------------------------------- live work under a session
+
+# Every Bash-tool command runs in a shell that sources the session's snapshot, so
+# this substring identifies "a command this session is running" and nothing else:
+# an MCP server, a pty host and the daemon are children too and must not be read
+# as work. Measured 2026-09-05 — the tool's shell is a direct child of `claude`:
+#   48628 30148 /bin/zsh -c source ~/.claude/shell-snapshots/snapshot-zsh-*.sh ...
+# A BACKGROUNDED command keeps that shell alive until it exits while appending
+# NOTHING to the transcript, so transcript quiet does not imply the session has
+# stopped working. This is the signal that does.
+SHELL_TOOL_SIGNATURE = "shell-snapshots/snapshot"
+
+
+def process_table():
+    """[(pid, ppid, command)] for every live process; [] if ps cannot be read."""
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid=,ppid=,command="],
+                              capture_output=True, text=True, timeout=30)
+    except Exception:
+        return []
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            rows.append((int(parts[0]), int(parts[1]), parts[2]))
+        except ValueError:
+            continue
+    return rows
+
+
+def descendant_pids(pid, table=None):
+    """Every live descendant of `pid`, excluding `pid` itself. Cycle-safe."""
+    rows = process_table() if table is None else table
+    children = {}
+    for child, parent, _cmd in rows:
+        children.setdefault(parent, []).append(child)
+    seen = set()
+    queue = list(children.get(pid, []))
+    while queue:
+        current = queue.pop()
+        if current == pid or current in seen:
+            continue
+        seen.add(current)
+        queue.extend(children.get(current, []))
+    return seen
+
+
+def running_tool_shells(pid, table=None):
+    """Commands of the Bash-tool shells still running under this session."""
+    rows = process_table() if table is None else table
+    live = descendant_pids(pid, rows)
+    return [cmd for (child, _parent, cmd) in rows
+            if child in live and SHELL_TOOL_SIGNATURE in cmd]
+
+
+# ---------------------------------------------------- the session pid registry
+
+SESSION_PIDS_PATH = os.path.join(ROOT, "session-pids.json")
+
+
+def _pid_lstart(pid):
+    """The kernel's start-time string for a live pid, or None if it is gone."""
+    try:
+        proc = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    return proc.stdout.strip() or None
+
+
+def live_session_process(session_id, registry_path=None):
+    """The registry entry whose process is still THIS session's, or None.
+
+    The registry is written by the session-pid-registry SessionStart hook, which
+    exists because a usage limit does not kill the process — it only makes every
+    request fail. Liveness is re-derived here rather than trusted, carrying the
+    hook's own pid-reuse guard: a recycled pid gets a new start time, so a
+    recorded `lstart` that no longer matches means the process we were told about
+    is gone and something unrelated now owns the number.
+    """
+    path = registry_path or SESSION_PIDS_PATH
+    try:
+        with open(path) as f:
+            registry = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    entries = registry.get(session_id) if isinstance(registry, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in reversed(entries):          # newest registration wins
+        if not isinstance(entry, dict):
+            continue
+        pid = entry.get("pid")
+        if not isinstance(pid, int):
+            continue
+        lstart = _pid_lstart(pid)
+        if lstart is None:
+            continue
+        recorded = entry.get("lstart")
+        if recorded and recorded != lstart:
+            continue
+        return entry
+    return None
+
+
+# ------------------------------------------------------------ the live terminal
+
+def iterm_session_ids():
+    """Every session id iTerm currently holds open, or None if it cannot answer.
+
+    None is INDETERMINATE and must not be read as "that window is gone": iTerm not
+    installed, AppleScript refused, automation permission missing, a timeout —
+    none of those are evidence either way, and treating them as evidence would
+    send a healthy in-place switch down the destructive resume path.
+    """
+    if not os.path.isdir("/Applications/iTerm.app"):
+        return None
+    script = ('tell application "iTerm" to get id of every session '
+              'of every tab of every window')
+    try:
+        proc = subprocess.run(["osascript", "-e", script],
+                              capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return {part.strip() for part in proc.stdout.split(",") if part.strip()}
+
+
+def iterm_guid(entry):
+    """The bare session GUID from a registry entry's captured ITERM_SESSION_ID.
+
+    The variable's shape is "w3t0p0:GUID". The pane coordinates move when tabs are
+    rearranged or windows merged; the GUID does not, so only the GUID is a stable
+    handle on the window a session is actually sitting in.
+    """
+    raw = (entry or {}).get("iterm") or ""
+    guid = raw.split(":")[-1].strip()
+    return guid or None
+
+
+# ---------------------------------------------------------------- accounts
+#
+# A model switch answers a MODEL-SCOPED limit (opus/sonnet/fable): another tier
+# on the same account still has quota. It cannot answer a SHARED pool — the
+# 5-hour and weekly limits gate every model the account can reach, so the only
+# move left is another account, or waiting for the reset.
+#
+# The switch itself lives in the `claude_account` script beside this module; it
+# owns the Keychain and ~/.claude.json handling. This section decides WHEN to
+# call it and WHICH account to move to, and records what it learns so the next
+# tick does not retry an account it already knows is spent.
+
+ACCOUNT_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "claude_account")
+ACCOUNT_PREFERENCE = os.path.join(ROOT, "account-preference.json")
+ACCOUNT_TIMEOUT = 20
+
+
+def _account_run(args):
+    """(ok, stdout, stderr) from the account tool. Never raises."""
+    try:
+        # Run through the tool's own shebang rather than naming an
+        # interpreter: the supervisor is launched by launchd under the system
+        # python, and hard-coding that here would break a machine where the
+        # tool ships for a different one.
+        proc = subprocess.run([ACCOUNT_TOOL] + list(args),
+                              capture_output=True, text=True,
+                              timeout=ACCOUNT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "", str(exc)
+    return proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip()
+
+
+def account_preference():
+    """Emails in the order the owner wants them used, best first.
+
+    An explicit file wins. Without one the order is by plan size, because a 20x
+    account carries four times the quota of a 5x and preferring it is not a
+    matter of taste. Ordering is never inferred from which account happens to be
+    logged in.
+    """
+    try:
+        with open(ACCOUNT_PREFERENCE, encoding="utf-8") as fh:
+            declared = json.load(fh)
+        if isinstance(declared, list) and declared:
+            return [str(e) for e in declared]
+    except (OSError, ValueError):
+        pass
+
+    def plan_rank(record):
+        tier = str(record.get("rate_limit_tier") or "")
+        for size in (20, 5, 1):
+            if f"max_{size}x" in tier:
+                return -size
+        return 0
+
+    records = []
+    store = os.path.join(ROOT, "accounts")
+    try:
+        names = sorted(os.listdir(store))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(store, name), encoding="utf-8") as fh:
+                records.append(json.load(fh))
+        except (OSError, ValueError):
+            continue
+    return [r["email"] for r in sorted(records, key=plan_rank)
+            if r.get("email")]
+
+
+def current_account():
+    """The email logged in right now, or None if that cannot be read."""
+    ok, out, _ = _account_run(["current"])
+    return out.split()[0] if ok and out else None
+
+
+def _account_record(email):
+    """The stored record for `email`, or None when it cannot be read."""
+    path = os.path.join(ROOT, "accounts", f"{email}.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def account_is_open(email, kind):
+    """Is `email` a usable destination for a session stalled on `kind`?
+
+    Read from the stored record rather than by probing: a probe costs a request
+    against an account we may not even switch to, and it can only be made after
+    switching to it, which is the thing being decided.
+
+    THE TWO SHARED POOLS ARE NOT INDEPENDENT. Both the 5-hour and the weekly
+    limit mean "this account cannot serve a request right now" — they differ only
+    in when they lift. So a weekly-spent account is closed to a session-limited
+    move as well, and reading the pools separately would send a stalled session
+    onto an account that cannot answer it either. Model-scoped pools
+    (opus/sonnet/fable) genuinely are independent, but they never reach here:
+    /model answers those without changing accounts.
+    """
+    record = _account_record(email)
+    if record is None:
+        return False, f"{email}: no stored record"
+
+    usable, reason = _credential_reason(record)
+    if not usable:
+        return False, f"{email}: {reason}"
+
+    now = time.time()
+    for pool, entry in (record.get("limits") or {}).items():
+        resets = entry.get("resets_at")
+        if not isinstance(resets, (int, float)) or resets <= now:
+            continue
+        # A SHARED pool shuts the whole account. The 5-hour and weekly limits
+        # gate every model, so an account spent on either cannot serve an Opus
+        # request any more than a plain one — reading them as independent of the
+        # model pools would send a session onto an account that answers nothing.
+        # A MODEL pool is narrower: Opus being spent says nothing about Sonnet,
+        # and nothing about the shared pools either.
+        blocks = pool in SHARED_POOL_KINDS or pool == kind
+        if blocks:
+            when = datetime.datetime.fromtimestamp(resets, UTC)
+            return False, (f"{email}: {pool} spent until "
+                           f"{when:%Y-%m-%d %H:%M}Z")
+    return True, f"{email}: {reason}"
+
+
+def _credential_reason(record):
+    """(usable, reason) for a stored record's refresh token.
+
+    Mirrors the account tool's own check so the decision does not depend on
+    parsing that tool's printed output.
+    """
+    oauth = (record.get("credentials") or {}).get("claudeAiOauth") or {}
+    ms = oauth.get("refreshTokenExpiresAt")
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return True, "no refresh expiry recorded"
+    when = datetime.datetime.fromtimestamp(ms / 1000, UTC)
+    if when <= datetime.datetime.now(UTC):
+        return False, f"refresh token expired {when:%Y-%m-%d %H:%M}Z"
+    return True, f"credential ok to {when:%Y-%m-%d %H:%M}Z"
+
+
+def choose_open_account(exhausted_kind, exclude=()):
+    """(email, detail) for the best account to move to, or (None, why).
+
+    Preference order decides, and the first account that is both credential-valid
+    and not recorded as blocked on this pool wins.
+    """
+    tried = []
+    for email in account_preference():
+        if email in exclude:
+            continue
+        open_now, detail = account_is_open(email, exhausted_kind)
+        tried.append(f"{email}={'open' if open_now else 'closed'}")
+        if open_now:
+            return email, detail
+    if not tried:
+        return None, ("no accounts captured — run "
+                      "`.claude/scripts/claude_account capture` while logged "
+                      "into each")
+    return None, "every stored account is closed (" + ", ".join(tried) + ")"
+
+
+def note_account_limit(email, kind, resets_at):
+    """Record that `kind` is spent on `email` until `resets_at` (epoch seconds)."""
+    if not (email and kind and resets_at):
+        return False
+    ok, _, _ = _account_run(["note-limit", email, kind, str(int(resets_at))])
+    return ok
+
+
+def switch_account(email, dry_run=False, force=False):
+    """(ok, detail). Moves the machine's Claude Code login to `email`.
+
+    `force` overrides the tool's refusal to switch while other sessions are
+    running. That refusal is right for a person at a keyboard and wrong for a
+    pool the whole account shares: see `account_switch_disrupts_others`.
+    """
+    args = ["switch", email]
+    if dry_run:
+        args.append("--dry-run")
+    if force:
+        args.append("--force")
+    ok, out, err = _account_run(args)
+    return ok, (out or err)
+
+
+def live_sessions_count():
+    """How many Claude Code sessions are running, excluding this process."""
+    ok, out, _ = _account_run(["live-sessions"])
+    try:
+        return int(out.strip()) if ok else 0
+    except ValueError:
+        return 0
+
+
+def account_switch_disrupts_others(kind):
+    """Would switching accounts for `kind` harm sessions that are still working?
+
+    A SHARED pool is shared by every session on the account, so when one dies on
+    it the others are already dead or about to be: switching costs them nothing
+    they had not already lost, and it is the only route back for any of them.
+
+    A MODEL pool is not. A session stalled on Opus says nothing about a session
+    happily running Fable, and moving the machine's account out from under that
+    one breaks work that was fine — measured 2026-09-05, when an eight-second
+    manual switch killed two subagents in another session.
+    """
+    return kind not in SHARED_POOL_KINDS
+
+
+def refresh_account_capture():
+    """Keep the ACTIVE account's stored blob current.
+
+    Claude Code refreshes its own tokens on its own schedule. If a refresh also
+    rotates the refresh token, a stored copy taken days ago is dead on arrival,
+    and the failure appears as a relaunched session sitting at a login prompt.
+    Re-capturing costs one Keychain read and one small file write, so the
+    supervisor does it every tick rather than reasoning about whether rotation
+    happens.
+    """
+    ok, _, _ = _account_run(["capture"])
+    return ok
