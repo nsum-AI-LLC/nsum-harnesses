@@ -70,6 +70,15 @@ handle (append-and-close writes), and the **environment** has no session id.
 
 ## Install
 
+**This directory is the source of truth, and a consuming project keeps no copy.**
+The supervisor is one launchd job watching every session on the machine, so it is
+installed once rather than synced per project — `sync_tooling` does not touch it.
+Edit here, then install.
+
+A copy checked into a consumer repository reads as authoritative to whoever finds
+it next, and a session searching only its own repository will find that copy, or a
+stale snapshot of it, and conclude the running supervisor is untracked.
+
 ```bash
 ./install.sh          # installs, arms launchd, self-tests, dry-runs
 ```
